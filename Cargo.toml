@@ -16,3 +16,9 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+
+# Runs in its own process (no libtest threads) so the engine's thread-local
+# visual pool starts empty, as in a fresh screensaver process.
+[[test]]
+name = "starship_pool_ceiling"
+harness = false

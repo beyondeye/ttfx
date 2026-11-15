@@ -1,0 +1,818 @@
+//! starship effect tests: the bounded palette, the timing controls, the
+//! timeline and transitions, and the per-scene signatures from
+//! aidocs/starship/storyboard.md (§1.3 metrics, §1.6 region, §4 signatures).
+
+use clap::Parser;
+
+use ttfx::cli::Cli;
+use ttfx::effects::starship::palette::{self, palette, Ramp, ALL_RAMPS, P_CAP, PLACEHOLDER};
+use ttfx::effects::starship::raster::Pixbuf;
+use ttfx::effects::starship::timeline::{self, blend_weight, scene_at, Blend, SceneId, TOTAL_SECONDS};
+use ttfx::effects::starship::{Starship, StarshipConfig, HALF_BLOCK};
+use ttfx::engine::canvas::Anchor;
+use ttfx::engine::ctx::{Clock, EngineCtx};
+use ttfx::engine::effect::Effect;
+use ttfx::engine::terminal::{CharacterFilter, TerminalConfig};
+use ttfx::utils::rng::Rng;
+
+const INPUT: &str = include_str!("fixtures/starship_input.txt");
+
+/// 1080p and 4K grids at scale 1 (storyboard §1.1).
+const GRID_1080: (i64, i64) = (137, 33);
+const GRID_4K: (i64, i64) = (274, 67);
+
+// ---- harness ----------------------------------------------------------------
+
+struct Run {
+    ctx: EngineCtx,
+    fx: Starship,
+    fps: i64,
+}
+
+fn config(start_at: f64, duration_scale: f64, stress: bool) -> StarshipConfig {
+    StarshipConfig { start_at, duration_scale, stress }
+}
+
+fn run_with(grid: (i64, i64), fps: i64, seed: u64, cfg: StarshipConfig) -> Run {
+    let tc = TerminalConfig {
+        frame_rate: fps,
+        canvas_width: grid.0,
+        canvas_height: grid.1,
+        ignore_terminal_dimensions: true,
+        reuse_canvas: true,
+        anchor_canvas: Anchor::C,
+        anchor_text: Anchor::C,
+        ..TerminalConfig::default()
+    };
+    let mut ctx = EngineCtx::new(INPUT, tc, Rng::seeded(seed), Clock::virtual_with_frame_rate(fps)).expect("ctx");
+    let mut fx = Starship::new(cfg);
+    fx.build(&mut ctx).expect("build");
+    Run { ctx, fx, fps }
+}
+
+fn run(grid: (i64, i64), fps: i64, seed: u64) -> Run {
+    run_with(grid, fps, seed, StarshipConfig::default())
+}
+
+impl Run {
+    fn frame(&mut self) -> Option<String> {
+        self.fx.next_frame(&mut self.ctx)
+    }
+
+    /// Play until the frame at storyboard time `t` has been emitted.
+    fn play_to(&mut self, t: f64) {
+        let target = (t * self.fps as f64).round() as u64;
+        while self.ticks_done() <= target {
+            self.frame().expect("frame before the end");
+        }
+    }
+
+    fn ticks_done(&self) -> u64 {
+        self.fx.ticks().1
+    }
+
+    /// The emitted half-block pixels of the last frame, read from the engine's
+    /// own cell visuals (what `ctx.frame()` formats).
+    fn engine_pixels(&self) -> Vec<[u8; 3]> {
+        let (cols, rows) = self.fx.grid();
+        let canvas = &self.ctx.terminal.canvas;
+        let mut out = vec![[0u8; 3]; cols * rows * 2];
+        let all = CharacterFilter { input_chars: true, inner_fill_chars: true, outer_fill_chars: true, added_chars: false };
+        for id in self.ctx.terminal.collect_characters(all) {
+            let ch = &self.ctx.terminal.arena[id.0 as usize];
+            let c = ch.motion.current_coord;
+            let (col, row) = ((c.column - canvas.left) as usize, (canvas.top - c.row) as usize);
+            let v = ch.animation.current_character_visual;
+            assert_eq!(v.symbol, HALF_BLOCK);
+            let colors = v.colors.expect("colours");
+            let rgb = |c: Option<ttfx::utils::graphics::Color>| {
+                let (r, g, b) = c.expect("set").rgb_ints();
+                [r, g, b]
+            };
+            out[2 * row * cols + col] = rgb(colors.fg_color);
+            out[(2 * row + 1) * cols + col] = rgb(colors.bg_color);
+        }
+        out
+    }
+}
+
+// ---- metrics (storyboard §1.3, §1.6) ----------------------------------------
+
+fn dist(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let d = |x: u8, y: u8| (x as f64 - y as f64).powi(2);
+    (d(a[0], b[0]) + d(a[1], b[1]) + d(a[2], b[2])).sqrt()
+}
+
+fn luma(c: [u8; 3]) -> f64 {
+    (0.2126 * c[0] as f64 + 0.7152 * c[1] as f64 + 0.0722 * c[2] as f64) / 255.0
+}
+
+fn hexrgb(h: u32) -> [u8; 3] {
+    [(h >> 16) as u8, (h >> 8) as u8, h as u8]
+}
+
+/// Pixels inside the measurement region u ∈ [0,1), v ∈ [0, 0.82) (by centre).
+fn region(px: &[[u8; 3]], cols: usize) -> Vec<[u8; 3]> {
+    let h = px.len() / cols;
+    let mut out = Vec::new();
+    for y in 0..h {
+        if (y as f64 + 0.5) / h as f64 >= 0.82 {
+            break;
+        }
+        out.extend_from_slice(&px[y * cols..(y + 1) * cols]);
+    }
+    out
+}
+
+fn frac(px: &[[u8; 3]], pred: impl Fn([u8; 3]) -> bool) -> f64 {
+    px.iter().filter(|&&p| pred(p)).count() as f64 / px.len().max(1) as f64
+}
+
+fn near(px: &[[u8; 3]], hex: u32) -> f64 {
+    frac(px, |p| dist(p, hexrgb(hex)) <= 48.0)
+}
+
+fn near_black(px: &[[u8; 3]]) -> f64 {
+    frac(px, |p| luma(p) < 0.08)
+}
+
+fn bright(px: &[[u8; 3]]) -> f64 {
+    frac(px, |p| luma(p) > 0.70)
+}
+
+/// Mean per-pixel RGB distance (position-sensitive) and the fraction of
+/// pixels that moved by more than 30.
+fn frame_distance(a: &[[u8; 3]], b: &[[u8; 3]]) -> (f64, f64) {
+    assert_eq!(a.len(), b.len());
+    let (mut sum, mut big) = (0.0, 0usize);
+    for (p, q) in a.iter().zip(b) {
+        let d = dist(*p, *q);
+        sum += d;
+        if d > 30.0 {
+            big += 1;
+        }
+    }
+    (sum / a.len() as f64, big as f64 / a.len() as f64)
+}
+
+fn pixbuf_rgb(buf: &Pixbuf) -> Vec<[u8; 3]> {
+    buf.px.iter().map(|c| [c[0].clamp(0.0, 255.0) as u8, c[1].clamp(0.0, 255.0) as u8, c[2].clamp(0.0, 255.0) as u8]).collect()
+}
+
+// ---- the bounded palette ----------------------------------------------------
+
+#[test]
+fn palette_cap_and_constancy() {
+    let p = palette();
+    assert!(p.len() <= P_CAP, "palette {} > cap {P_CAP}", p.len());
+    assert!(p.index_of(PLACEHOLDER).is_some(), "placeholder colour is a palette entry");
+    let fresh = palette::Palette::build_uncached();
+    assert_eq!(fresh.checksum(), p.checksum(), "the palette is a pure constant");
+    assert_eq!(fresh.len(), p.len());
+}
+
+fn emitted_in_palette(r: &Run) {
+    let pal = palette();
+    for px in r.engine_pixels() {
+        assert!(pal.index_of(px).is_some(), "emitted colour {px:?} is not a palette entry");
+    }
+}
+
+#[test]
+fn emitted_colours_in_palette_and_appearance_bound() {
+    use std::collections::HashSet;
+    let pal = palette();
+    let mut seen: HashSet<([u8; 3], [u8; 3])> = HashSet::new();
+    let mut counts = Vec::new();
+    for (seed, stress) in [(1, false), (2, false), (3, false), (4, true)] {
+        let mut r = run_with(GRID_1080, 60, seed, config(0.0, 1.0, stress));
+        let mut k = 0u64;
+        while r.frame().is_some() {
+            // Every 4th tick keeps the run fast; colours are checked each time.
+            if k.is_multiple_of(4) {
+                let px = r.engine_pixels();
+                for pair in px.chunks(r.fx.grid().0 * 2).flat_map(|rows| {
+                    let cols = rows.len() / 2;
+                    (0..cols).map(move |c| (rows[c], rows[cols + c]))
+                }) {
+                    assert!(pal.index_of(pair.0).is_some() && pal.index_of(pair.1).is_some());
+                    seen.insert(pair);
+                }
+            }
+            k += 1;
+            if stress && k > 240 {
+                break;
+            }
+        }
+        counts.push(seen.len());
+    }
+    let bound = pal.len() * pal.len();
+    eprintln!("appearance counts after each run: {counts:?} (bound |P|² = {bound})");
+    assert!(seen.len() <= bound);
+}
+
+#[test]
+fn emission_path_shared() {
+    // The ceiling test measures `emit_appearance`; no other call may create
+    // appearances (the visual cache only reuses what it interned).
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/effects/starship");
+    let mut calls = 0;
+    for entry in walk(dir) {
+        let text = std::fs::read_to_string(&entry).unwrap();
+        calls += text.matches(".set_appearance(").count();
+    }
+    assert_eq!(calls, 1, "exactly one set_appearance call (inside emit_appearance)");
+}
+
+fn walk(dir: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(p.to_str().unwrap()));
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Palette-mapping error over synthetic content shaped like scenes 1–3: every
+/// declared ramp as a continuous full-screen gradient, plus smoke and plume
+/// colours alpha-blended over the sky ramps.
+#[test]
+fn palette_error_synthetic() {
+    let pal = palette();
+    let mut errs: Vec<f64> = Vec::new();
+    let mut measure = |c: [f32; 3]| {
+        let q = pal.rgb_of(pal.nearest(c));
+        let c8 = [c[0].round() as u8, c[1].round() as u8, c[2].round() as u8];
+        errs.push(dist(c8, q));
+    };
+    let lerp = |a: [u8; 3], b: [u8; 3], t: f32| -> [f32; 3] {
+        [0, 1, 2].map(|k| a[k] as f32 + (b[k] as f32 - a[k] as f32) * t)
+    };
+    let ramps: Vec<Ramp> = ALL_RAMPS.iter().flat_map(|r| r.iter().copied()).collect();
+    for r in &ramps {
+        for i in 0..=134 {
+            measure(lerp(hexrgb(r.a), hexrgb(r.b), i as f32 / 134.0));
+        }
+    }
+    let overlays = [0xdacbad, 0xb3a086, 0xd9c9b3, 0xc3b2b9, 0xd0b3bd, 0xf1e9d3, 0xe2af7b];
+    let skies = [0x23465a, 0x406e88, 0x2c507a, 0x3b6187, 0x44709b, 0x255687, 0x5d6570, 0x272929];
+    for &o in &overlays {
+        for &s in &skies {
+            for i in 0..=12 {
+                let a = 0.2 + 0.6 * i as f32 / 12.0;
+                measure(lerp(hexrgb(s), hexrgb(o), a));
+            }
+        }
+    }
+    errs.sort_by(|a, b| a.total_cmp(b));
+    let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+    let p99 = errs[(errs.len() - 1) * 99 / 100];
+    eprintln!("palette error (synthetic): n={} mean={mean:.2} p99={p99:.2} max={:.2} |P|={}", errs.len(), errs.last().unwrap(), pal.len());
+    assert!(mean <= 6.0, "mean palette error {mean:.2} > 6");
+    assert!(p99 <= 20.0, "p99 palette error {p99:.2} > 20");
+}
+
+#[test]
+fn stress_changes_every_cell() {
+    let mut r = run_with(GRID_1080, 60, 1, config(0.0, 1.0, true));
+    let cells = (GRID_1080.0 * GRID_1080.1) as usize;
+    let mut prev: Option<Vec<String>> = None;
+    for k in 0..120 {
+        let frame = r.frame().expect("frame");
+        if k > 0 {
+            assert_eq!(r.fx.changed_cells(), cells, "tick {k}: every cell must change");
+        }
+        let rows: Vec<String> = frame.split('\n').map(str::to_owned).collect();
+        if let Some(p) = &prev {
+            for (i, (a, b)) in p.iter().zip(rows.iter()).enumerate() {
+                assert_ne!(a, b, "tick {k}: row {i} unchanged");
+            }
+        }
+        prev = Some(rows);
+    }
+}
+
+// ---- determinism and length -------------------------------------------------
+
+#[test]
+fn determinism() {
+    let mut a = run(GRID_1080, 60, 7);
+    let mut b = run(GRID_1080, 60, 7);
+    for k in 0..600 {
+        assert_eq!(a.frame(), b.frame(), "tick {k}");
+    }
+}
+
+fn count_frames(r: &mut Run) -> u64 {
+    let mut n = 0;
+    while r.frame().is_some() {
+        n += 1;
+    }
+    n
+}
+
+#[test]
+fn length_60_and_120() {
+    for fps in [60, 120] {
+        let mut r = run(GRID_1080, fps, 1);
+        let n = count_frames(&mut r);
+        assert_eq!(n, (TOTAL_SECONDS * fps as f64) as u64, "frames at {fps} fps");
+    }
+}
+
+// ---- timing controls --------------------------------------------------------
+
+#[test]
+fn duration_scale_length() {
+    for (scale, expect) in [(0.5, 1920), (2.0, 7680)] {
+        let mut r = run_with(GRID_1080, 60, 1, config(0.0, scale, false));
+        assert_eq!(count_frames(&mut r), expect, "scale {scale}");
+    }
+}
+
+#[test]
+fn duration_scale_keeps_storyboard_time() {
+    // At scale 2 the frame for storyboard 19.0 s is tick 19·60·2 and shows scene 3.
+    let mut r = run_with(GRID_1080, 60, 1, config(0.0, 2.0, false));
+    let tick = (19.0f64 * 60.0 * 2.0) as u64;
+    while r.ticks_done() <= tick {
+        r.frame().unwrap();
+    }
+    assert!((r.fx.time() - 19.0).abs() < 1e-9, "storyboard time {}", r.fx.time());
+    assert_eq!(scene_at(r.fx.time()), SceneId::S3);
+    // Pacing changes, content does not: the scene-3 signature still holds.
+    let sig = SIGS.iter().find(|s| s.name == "3").unwrap();
+    let fails = check_sig(sig, &r);
+    assert!(fails.is_empty(), "scene 3 at 2x duration scale: {fails:?}");
+    emitted_in_palette(&r);
+}
+
+#[test]
+fn seek_matches_uninterrupted() {
+    for scale in [1.0, 2.0] {
+        for start in [11.5, 11.503] {
+            let mut full = run_with(GRID_1080, 60, 3, config(0.0, scale, false));
+            let target = (start * 60.0 * scale).round() as u64;
+            let mut frames = Vec::new();
+            let mut k = 0;
+            while let Some(f) = full.frame() {
+                if k >= target {
+                    frames.push(f);
+                }
+                if frames.len() > 60 {
+                    break;
+                }
+                k += 1;
+            }
+            let mut seek = run_with(GRID_1080, 60, 3, config(start, scale, false));
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(seek.frame().as_ref(), Some(f), "scale {scale} start {start}: frame +{i}");
+            }
+        }
+    }
+}
+
+#[test]
+fn seek_near_end_still_plays() {
+    let mut r = run_with(GRID_1080, 60, 1, config(63.99, 1.0, false));
+    assert!(count_frames(&mut r) >= 1);
+    let mut low = run_with(GRID_1080, 1, 1, config(63.9, 0.25, false));
+    assert!(count_frames(&mut low) >= 1, "a low frame rate and a late seek still emit a frame");
+}
+
+#[test]
+fn invalid_timing_args_rejected() {
+    let parse = |args: &[&str]| {
+        let mut v = vec!["ttfx", "starship"];
+        v.extend_from_slice(args);
+        Cli::try_parse_from(v)
+    };
+    for bad in ["0", "-1", "nan", "inf", "0.2", "4.5", "x"] {
+        assert!(parse(&["--duration-scale", bad]).is_err(), "--duration-scale {bad} must be rejected");
+    }
+    for bad in ["-1", "nan", "inf", "64", "100", "x"] {
+        assert!(parse(&["--start-at", bad]).is_err(), "--start-at {bad} must be rejected");
+    }
+    for good in [&["--duration-scale", "0.25"][..], &["--duration-scale", "4.0"], &["--start-at", "0"], &["--start-at", "63.5"]] {
+        assert!(parse(good).is_ok(), "{good:?} must be accepted");
+    }
+}
+
+// ---- timeline ---------------------------------------------------------------
+
+#[test]
+fn timeline_table_matches_storyboard() {
+    let total: f64 = timeline::SCENES.iter().map(|s| s.dur).sum();
+    assert!((total - TOTAL_SECONDS).abs() < 1e-9);
+    for w in timeline::SCENES.windows(2) {
+        assert!((w[0].end() - w[1].start).abs() < 1e-9, "scenes are contiguous");
+    }
+    assert_eq!(scene_at(10.2), SceneId::S2, "B is reported inside the fade");
+}
+
+#[test]
+fn blend_weight_monotonic() {
+    for (start, d) in [(10.0, 0.5), (30.0, 1.0), (timeline::LOOP_FADE_START, TOTAL_SECONDS - timeline::LOOP_FADE_START)] {
+        let mut last = -1.0;
+        for i in 0..=1000 {
+            let t = start + d * i as f64 / 1000.0 - 1e-9;
+            if t < start || t >= start + d {
+                continue;
+            }
+            let w = match blend_weight(t) {
+                Some(Blend::Fade { w, .. }) | Some(Blend::Loop { w }) => w,
+                None => panic!("no blend at {t}"),
+            };
+            assert!(w >= last && (0.0..=1.0).contains(&w), "monotonic at {t}");
+            last = w;
+        }
+    }
+    assert!(blend_weight(10.5).is_none() && blend_weight(9.99).is_none());
+}
+
+/// Visual check of the palette (not run by default):
+/// `cargo test --release --test starship palette_preview -- --ignored --nocapture`
+/// Each line is one declared ramp, 120 cells wide: the top half of each cell is
+/// the exact gradient, the bottom half what the palette emits for it.
+#[test]
+#[ignore]
+fn palette_preview() {
+    let pal = palette();
+    let ramps: Vec<Ramp> = ALL_RAMPS.iter().flat_map(|r| r.iter().copied()).collect();
+    for r in &ramps {
+        let (a, b) = (hexrgb(r.a), hexrgb(r.b));
+        let mut line = String::new();
+        for i in 0..120 {
+            let t = i as f32 / 119.0;
+            let c = [0, 1, 2].map(|k| a[k] as f32 + (b[k] as f32 - a[k] as f32) * t);
+            let q = pal.rgb_of(pal.nearest(c));
+            line.push_str(&format!(
+                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
+                c[0].round() as u8, c[1].round() as u8, c[2].round() as u8, q[0], q[1], q[2]
+            ));
+        }
+        println!("{line}\x1b[0m #{:06x} → #{:06x}", r.a, r.b);
+    }
+}
+
+// ---- signatures (storyboard §4) ---------------------------------------------
+
+struct Sig {
+    name: &'static str,
+    t: f64,
+    /// (colour, expected %, tolerance %)
+    near: &'static [(u32, f64, f64)],
+    near_black: (f64, f64),
+    bright: (f64, f64),
+}
+
+const SIGS: &[Sig] = &[
+    Sig { name: "1a", t: 3.0, near: &[(0x1e3d4e, 45.0, 15.0), (0xdacbad, 15.0, 12.0)], near_black: (0.0, 30.0), bright: (5.0, 100.0) },
+    Sig {
+        name: "1b",
+        t: 8.0,
+        near: &[(0x272929, 65.0, 12.0), (0x11171b, 60.0, 12.0), (0xd9c9b3, 11.0, 10.0)],
+        near_black: (0.0, 30.0),
+        bright: (3.0, 100.0),
+    },
+    Sig { name: "2a", t: 11.5, near: &[(0x3b6187, 55.0, 20.0)], near_black: (0.0, 10.0), bright: (0.0, 5.0) },
+    Sig { name: "2b", t: 14.2, near: &[(0x2b4e77, 90.0, 10.0)], near_black: (0.0, 5.0), bright: (0.0, 3.0) },
+    Sig {
+        name: "3",
+        t: 19.0,
+        near: &[(0x497197, 47.0, 12.0), (0x5d6570, 50.0, 12.0), (0xeaebe4, 4.0, 10.0)],
+        near_black: (0.0, 10.0),
+        bright: (2.0, 100.0),
+    },
+];
+
+/// Measure one signature on a run already positioned at its time.
+fn check_sig(sig: &Sig, r: &Run) -> Vec<String> {
+    let cols = r.fx.grid().0;
+    let px = r.engine_pixels();
+    let reg = region(&px, cols);
+    let mut fails = Vec::new();
+    let mut report = format!("{} @ {:.1}s:", sig.name, sig.t);
+    for &(hex, want, tol) in sig.near {
+        let got = 100.0 * near(&reg, hex);
+        report += &format!(" #{hex:06x}={got:.1}% (want {want}±{tol})");
+        if (got - want).abs() > tol {
+            fails.push(format!("{}: near #{hex:06x} = {got:.1}%, want {want}±{tol}", sig.name));
+        }
+    }
+    let nb = 100.0 * near_black(&reg);
+    let br = 100.0 * bright(&reg);
+    report += &format!(" near-black={nb:.1}% bright={br:.1}%");
+    if nb < sig.near_black.0 || nb > sig.near_black.1 {
+        fails.push(format!("{}: near-black {nb:.1}% outside {:?}", sig.name, sig.near_black));
+    }
+    if br < sig.bright.0 || br > sig.bright.1 {
+        fails.push(format!("{}: bright {br:.1}% outside {:?}", sig.name, sig.bright));
+    }
+    let ph = 100.0 * near(&reg, 0xff00ff);
+    if ph > 0.0 {
+        fails.push(format!("{}: {ph:.1}% placeholder pixels", sig.name));
+    }
+    eprintln!("{report}");
+    fails
+}
+
+fn signatures_at(grid: (i64, i64), names: &[&str]) {
+    let mut r = run(grid, 60, 1);
+    let mut fails = Vec::new();
+    for sig in SIGS.iter().filter(|s| names.contains(&s.name)) {
+        r.play_to(sig.t);
+        fails.extend(check_sig(sig, &r));
+    }
+    assert!(fails.is_empty(), "signature failures at {grid:?}:\n{}", fails.join("\n"));
+}
+
+#[test]
+fn signatures_1080() {
+    signatures_at(GRID_1080, &["1a", "1b", "2a", "2b", "3"]);
+}
+
+#[test]
+fn signatures_4k() {
+    signatures_at(GRID_4K, &["1a", "3"]);
+}
+
+/// Dev aid (not run by default): write the emitted pixels at the given times
+/// as raw RGB (cols × 2·rows) for side-by-side checks against the animatic.
+/// `STARSHIP_DUMP=<scratch dir> STARSHIP_DUMP_T=3,8 cargo test --release --test starship dump_frames -- --ignored`
+#[test]
+#[ignore]
+fn dump_frames() {
+    let dir = std::env::var("STARSHIP_DUMP").expect("STARSHIP_DUMP=<dir>");
+    let times: Vec<f64> = std::env::var("STARSHIP_DUMP_T").unwrap_or("3".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    let grid = if std::env::var("STARSHIP_DUMP_4K").is_ok() { GRID_4K } else { GRID_1080 };
+    let mut r = run(grid, 60, 1);
+    for t in times {
+        r.play_to(t);
+        let bytes: Vec<u8> = r.engine_pixels().into_iter().flatten().collect();
+        std::fs::write(format!("{dir}/t{t:05.2}_{}x{}.rgb", grid.0, grid.1), bytes).unwrap();
+    }
+}
+
+/// Dev aid: print the per-tick distances around every boundary (calibration).
+#[test]
+#[ignore]
+fn calibrate_distances() {
+    for fps in [60i64, 120] {
+        let mut r = run(GRID_1080, fps, 1);
+        let mut prev: Option<Vec<[u8; 3]>> = None;
+        let mut k = 0u64;
+        let mut worst_fade: f64 = 0.0;
+        let mut worst_any: (f64, f64) = (0.0, 0.0);
+        while r.frame().is_some() {
+            let px = r.engine_pixels();
+            let t = r.fx.time();
+            if let Some(p) = &prev {
+                let (d, _) = frame_distance(p, &px);
+                let boundary = [6.0, 10.0, 12.5, 16.0, 22.0].iter().any(|b| (t - b).abs() < 0.6 / fps as f64);
+                if boundary {
+                    eprintln!("fps {fps} t {t:.3} step {d:.2}");
+                }
+                if (10.0..10.5).contains(&t) || (12.4..12.6).contains(&t) || t >= 62.5 {
+                    worst_fade = worst_fade.max(d);
+                }
+                if d > worst_any.0 && !boundary {
+                    worst_any = (d, t);
+                }
+            }
+            prev = Some(px);
+            k += 1;
+        }
+        eprintln!("fps {fps}: frames {k}, worst step in fades/continuous/loop {worst_fade:.2}, worst non-boundary step {:.2} at {:.3}", worst_any.0, worst_any.1);
+    }
+}
+
+// ---- transitions, motion and the loop (storyboard §1.5) ----------------------
+
+/// Mean per-pixel RGB distance allowed between consecutive ticks inside a
+/// cross-fade, across a continuous boundary, and from the last frame to the
+/// rebuild's first. Measured steps there are ≤ 2 at 60 fps (calibrate_distances).
+const STEP_LIMIT: f64 = 12.0;
+/// A hard cut must move the frame by more than this (measured: 81–256).
+const CUT_LIMIT: f64 = 25.0;
+
+/// Scenes still drawn as the flat placeholder; t1_4/t1_5 shrink this list.
+const PLACEHOLDER_SCENES: &[SceneId] = &[SceneId::S4, SceneId::S5, SceneId::S6, SceneId::S9, SceneId::S10, SceneId::S11, SceneId::B];
+
+#[test]
+fn placeholders_listed_honestly() {
+    let mut r = run(GRID_1080, 60, 1);
+    let cols = r.fx.grid().0;
+    for spec in timeline::SCENES {
+        // Mid-scene, but before the loop fade for B.
+        let t = (spec.start + spec.dur / 2.0).min(timeline::LOOP_FADE_START - 1.0);
+        r.play_to(t);
+        let reg = region(&r.engine_pixels(), cols);
+        let ph = 100.0 * frac(&reg, |p| p == PLACEHOLDER);
+        if PLACEHOLDER_SCENES.contains(&spec.id) {
+            assert!(ph >= 99.0, "{:?} is listed as a placeholder but only {ph:.1}% is: shrink PLACEHOLDER_SCENES", spec.id);
+        } else {
+            assert_eq!(ph, 0.0, "{:?} is implemented but shows {ph:.1}% placeholder", spec.id);
+        }
+    }
+}
+
+#[test]
+fn cuts_are_cuts() {
+    let mut r = run(GRID_1080, 60, 1);
+    for b in [6.0, 16.0, 22.0] {
+        r.play_to(b - 1.0 / 60.0);
+        let before = r.engine_pixels();
+        r.frame().unwrap();
+        assert!((r.fx.time() - b).abs() < 1e-9);
+        let (d, _) = frame_distance(&before, &r.engine_pixels());
+        assert!(d > CUT_LIMIT, "cut at {b}: distance {d:.1} ≤ {CUT_LIMIT}");
+    }
+}
+
+fn quantised(buf: &Pixbuf) -> Vec<[u8; 3]> {
+    let pal = palette();
+    pixbuf_rgb(buf).iter().map(|&c| pal.rgb_of(pal.nearest([c[0] as f32, c[1] as f32, c[2] as f32]))).collect()
+}
+
+#[test]
+fn fades_are_smooth_and_hit_their_endpoints() {
+    for (from, to, start, d) in [(SceneId::S1, SceneId::S2, 10.0, 0.5), (SceneId::S5, SceneId::S6, 30.0, 1.0)] {
+        let mut r = run(GRID_1080, 60, 1);
+        r.play_to(start - 1.0 / 60.0);
+        let mut prev = r.engine_pixels();
+        let ticks = (d * 60.0) as usize;
+        for i in 0..ticks {
+            r.frame().unwrap();
+            let px = r.engine_pixels();
+            let (step, _) = frame_distance(&prev, &px);
+            assert!(step < STEP_LIMIT, "{from:?}→{to:?} tick {i}: step {step:.2}");
+            if i == 0 {
+                let only_a = quantised(r.fx.render_only(from));
+                let (e, _) = frame_distance(&px, &only_a);
+                assert!(e < 2.0, "{from:?}→{to:?}: first fade tick is not {from:?} (distance {e:.2})");
+            }
+            if i == ticks - 1 {
+                let only_b = quantised(r.fx.render_only(to));
+                let (e, _) = frame_distance(&px, &only_b);
+                assert!(e < 3.0, "{from:?}→{to:?}: last fade tick is not {to:?} (distance {e:.2})");
+            }
+            prev = px;
+        }
+    }
+}
+
+/// Particles older than one tick existed before the boundary was crossed.
+fn survivors(r: &Run, owner: SceneId, dt: f64) -> usize {
+    r.fx.particles().iter().filter(|p| p.owner == owner.tag() && p.age > 1.5 * dt).count()
+}
+
+#[test]
+fn continuous_2a_2b_keeps_the_world() {
+    let dt = 1.0 / 60.0;
+    let mut r = run(GRID_1080, 60, 1);
+    r.play_to(12.5 - dt);
+    let before = r.engine_pixels();
+    let old = survivors(&r, SceneId::S2, dt);
+    // The edge detail emitted until 12.5 must carry over (storyboard §2.2).
+    let edge_before = r.fx.particles().iter().filter(|p| p.owner == SceneId::S2.tag() && p.size0 == 2.0).count();
+    r.frame().unwrap();
+    assert!((r.fx.time() - 12.5).abs() < 1e-9);
+    // A clear at this tick would leave only particles spawned on it (age 0).
+    let kept = survivors(&r, SceneId::S2, dt);
+    let edge_after = r.fx.particles().iter().filter(|p| p.owner == SceneId::S2.tag() && p.size0 == 2.0 && p.age > 1.5 * dt).count();
+    assert!(old > 0 && kept > 0, "pre-boundary particles must survive 12.5 (before {old}, after {kept})");
+    assert!(edge_before > 0 && edge_after > edge_before / 2, "edge detail carries over: {edge_before} → {edge_after}");
+    let (d, _) = frame_distance(&before, &r.engine_pixels());
+    assert!(d < STEP_LIMIT, "step across 12.5: {d:.2}");
+}
+
+#[test]
+fn hard_cuts_clear_the_pool() {
+    let dt = 1.0 / 60.0;
+    let mut r = run(GRID_1080, 60, 1);
+    for (b, owner) in [(6.0, SceneId::S1), (16.0, SceneId::S2), (22.0, SceneId::S3)] {
+        r.play_to(b - dt);
+        assert!(r.fx.live_particles() > 0, "particles alive before the cut at {b}");
+        r.frame().unwrap();
+        assert!(r.fx.particles().iter().all(|p| p.age <= 1.5 * dt), "the cut at {b} leaves no older particles");
+        assert_eq!(survivors(&r, owner, dt), 0);
+    }
+}
+
+#[test]
+fn ascent_plume_leaves_along_the_body() {
+    use ttfx::effects::starship::scenes::ascent::rocket;
+    let mut r = run(GRID_1080, 60, 1);
+    r.play_to(14.2);
+    let (_, _, tilt) = rocket(14.2);
+    assert!(tilt.to_degrees() > 10.0, "the test needs a tilted rocket");
+    // Drawn axis from the tip back to the engines: (−sin tilt, cos tilt).
+    let axis = (-tilt.sin(), tilt.cos());
+    let plume: Vec<_> = r.fx.particles().iter().filter(|p| p.owner == SceneId::S2.tag() && p.age < 0.05).collect();
+    assert!(plume.len() > 5, "fresh plume particles exist ({})", plume.len());
+    let (mut vx, mut vy) = (0.0, 0.0);
+    for p in &plume {
+        // Undo drag over its short age; the direction is what matters.
+        vx += p.vx;
+        vy += p.vy;
+    }
+    let n = (vx * vx + vy * vy).sqrt();
+    let cos = (vx * axis.0 + vy * axis.1) / n;
+    assert!(vx < 0.0, "a rocket leaning right exhausts to the left (mean vx {vx:+.4})");
+    assert!(cos > 0.95, "mean plume velocity within ~18° of the drawn axis (cos {cos:.3})");
+}
+
+#[test]
+fn gradient_primitives() {
+    let red = [255.0, 0.0, 0.0];
+    let blue = [0.0, 0.0, 255.0];
+    let black = [0.0, 0.0, 0.0];
+    // Radial: the centre pixel is the inner colour, the rim side the outer,
+    // outside is untouched, and red falls off monotonically along a radius.
+    let mut b = Pixbuf::new(41, 41);
+    b.radial(20.5, 20.5, 10.0, 10.0, red, blue, 1.0, 1.0);
+    let at = |b: &Pixbuf, x: usize, y: usize| b.px[y * b.w + x];
+    assert!(at(&b, 20, 20)[0] > 250.0 && at(&b, 20, 20)[2] < 5.0);
+    assert!(at(&b, 29, 20)[2] > 200.0, "near the rim is mostly the outer colour");
+    assert_eq!(at(&b, 32, 20), black, "outside the rim is untouched");
+    let reds: Vec<f32> = (20..30).map(|x| at(&b, x, 20)[0]).collect();
+    assert!(reds.windows(2).all(|w| w[1] <= w[0]), "monotonic: {reds:?}");
+    // Linear along a diagonal, clipped to a polygon, clamped past its ends.
+    let mut l = Pixbuf::new(20, 20);
+    let square = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
+    l.polygon_linear(&square, 5.0, 5.0, 15.0, 15.0, red, blue, 1.0);
+    assert_eq!(at(&l, 0, 0), red, "clamped before the start");
+    assert_eq!(at(&l, 19, 19), blue, "clamped after the end");
+    let mid = at(&l, 9, 10);
+    assert!((mid[0] - 127.5).abs() < 20.0 && (mid[2] - 127.5).abs() < 20.0, "midpoint is halfway: {mid:?}");
+    let tri = [(0.0, 0.0), (20.0, 0.0), (0.0, 20.0)];
+    let mut c = Pixbuf::new(20, 20);
+    c.polygon_linear(&tri, 0.0, 0.0, 20.0, 0.0, red, blue, 1.0);
+    assert_eq!(at(&c, 18, 18), black, "outside the polygon is untouched");
+}
+
+#[test]
+fn implemented_shots_move() {
+    let mut r = run(GRID_1080, 60, 1);
+    for (a, b) in [(2.0, 2.5), (7.0, 7.5), (11.0, 11.5), (14.0, 14.5), (18.0, 18.5)] {
+        r.play_to(a);
+        let pa = r.engine_pixels();
+        r.play_to(b);
+        // A frame-wide mean says little for a small rocket on a clear sky, so
+        // count pixels that actually changed.
+        let pb = r.engine_pixels();
+        let moved = pa.iter().zip(&pb).filter(|(x, y)| x != y).count();
+        assert!(moved >= 20, "frames at {a} and {b}: only {moved} pixels changed: frozen");
+    }
+}
+
+#[test]
+fn scene1_starts_without_particles() {
+    let mut r = run(GRID_1080, 60, 1);
+    r.frame().unwrap();
+    assert_eq!(r.fx.time(), 0.0);
+    assert_eq!(r.fx.live_particles(), 0);
+}
+
+#[test]
+fn loop_rebuild_is_seamless() {
+    for fps in [60, 120] {
+        let mut a = run(GRID_1080, fps, 5);
+        a.frame().unwrap();
+        let first = a.engine_pixels();
+        let mut last = first.clone();
+        while a.frame().is_some() {
+            last = a.engine_pixels();
+        }
+        // The screensaver rebuilds with the same seed after None.
+        let mut b = run(GRID_1080, fps, 5);
+        b.frame().unwrap();
+        let again = b.engine_pixels();
+        assert_eq!(first, again, "the rebuilt first frame differs ({fps} fps)");
+        let (d, _) = frame_distance(&last, &again);
+        assert!(d < STEP_LIMIT, "last → first frame distance {d:.2} at {fps} fps");
+    }
+}
+
+#[test]
+fn palette_error_real_frames() {
+    let mut r = run(GRID_1080, 60, 1);
+    let mut errs = Vec::new();
+    for sig in SIGS {
+        r.play_to(sig.t);
+        let src = pixbuf_rgb(r.fx.unquantised());
+        for (a, b) in src.iter().zip(r.fx.pixels()) {
+            errs.push(dist(*a, b));
+        }
+    }
+    errs.sort_by(|a, b| a.total_cmp(b));
+    let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+    let p99 = errs[(errs.len() - 1) * 99 / 100];
+    eprintln!("palette error (scenes 1–3): mean={mean:.2} p99={p99:.2}");
+    assert!(mean <= 6.0 && p99 <= 20.0, "palette error mean {mean:.2} p99 {p99:.2}");
+}
