@@ -31,6 +31,7 @@ pub mod slide;
 pub mod smoke;
 pub mod spotlights;
 pub mod spray;
+pub mod stub;
 pub mod swarm;
 pub mod sweep;
 pub mod synthgrid;
@@ -104,6 +105,8 @@ pub enum EffectCommand {
     Spotlights(spotlights::SpotlightsConfig),
     /// Draws the characters spawning at varying rates from a single point.
     Spray(spray::SprayConfig),
+    /// A starting point for a new effect: groups of characters fade in one after another.
+    Stub(stub::StubConfig),
     /// Characters are grouped into swarms and move around the terminal before settling into position.
     Swarm(swarm::SwarmConfig),
     /// Sweep across the canvas to reveal uncolored text, reverse sweep to color the text.
@@ -154,6 +157,7 @@ impl EffectCommand {
             EffectCommand::Smoke(config) => Box::new(smoke::Smoke::new(config.clone())),
             EffectCommand::Spotlights(config) => Box::new(spotlights::Spotlights::new(config.clone())),
             EffectCommand::Spray(config) => Box::new(spray::Spray::new(config.clone())),
+            EffectCommand::Stub(config) => Box::new(stub::Stub::new(config.clone())),
             EffectCommand::Swarm(config) => Box::new(swarm::Swarm::new(config.clone())),
             EffectCommand::Sweep(config) => Box::new(sweep::Sweep::new(config.clone())),
             EffectCommand::Synthgrid(config) => Box::new(synthgrid::SynthGrid::new(config.clone())),
@@ -196,6 +200,7 @@ impl EffectCommand {
             EffectCommand::Smoke(_) => "smoke",
             EffectCommand::Spotlights(_) => "spotlights",
             EffectCommand::Spray(_) => "spray",
+            EffectCommand::Stub(_) => "stub",
             EffectCommand::Swarm(_) => "swarm",
             EffectCommand::Sweep(_) => "sweep",
             EffectCommand::Synthgrid(_) => "synthgrid",

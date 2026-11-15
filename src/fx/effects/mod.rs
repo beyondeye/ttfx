@@ -117,6 +117,8 @@ pub fn build(command: &EffectCommand) -> Option<Box<dyn Effect>> {
         )),
         EffectCommand::Slice(config) => Some(Box::new(slice::Slice::new(config.clone()))),
         EffectCommand::Sweep(config) => Some(Box::new(sweep::Sweep::new(config.clone()))),
+        // Not ported to the fx engine: runs on the original engine.
+        EffectCommand::Stub(_) => None,
     }
 }
 
