@@ -6,7 +6,9 @@ use clap::Parser;
 
 use ttfx::cli::Cli;
 use ttfx::effects::starship::palette::{self, palette, Ramp, ALL_RAMPS, P_CAP, PLACEHOLDER};
+use ttfx::effects::starship::particles::POOL_CAPACITY;
 use ttfx::effects::starship::raster::Pixbuf;
+use ttfx::effects::starship::scenes::{hot_staging, over_earth, seco, space};
 use ttfx::effects::starship::timeline::{self, blend_weight, scene_at, Blend, SceneId, TOTAL_SECONDS};
 use ttfx::effects::starship::{Starship, StarshipConfig, HALF_BLOCK};
 use ttfx::engine::canvas::Anchor;
@@ -260,12 +262,22 @@ fn palette_error_synthetic() {
     }
     let overlays = [0xdacbad, 0xb3a086, 0xd9c9b3, 0xc3b2b9, 0xd0b3bd, 0xf1e9d3, 0xe2af7b];
     let skies = [0x23465a, 0x406e88, 0x2c507a, 0x3b6187, 0x44709b, 0x255687, 0x5d6570, 0x272929];
-    for &o in &overlays {
-        for &s in &skies {
-            for i in 0..=12 {
-                let a = 0.2 + 0.6 * i as f32 / 12.0;
-                measure(lerp(hexrgb(s), hexrgb(o), a));
-            }
+    let mut pairs: Vec<(u32, u32)> = overlays.iter().flat_map(|&o| skies.iter().map(move |&s| (o, s))).collect();
+    // The space scenes' particles and glows over their own backgrounds.
+    pairs.extend([
+        (0xe6e1db, 0x0d1725),
+        (0x694f5c, 0x0d1725),
+        (0xc9d2d9, 0x1f2636),
+        (0xc9d2d9, 0x094287),
+        (0xfafaf7, 0x0e448a),
+        (0xd5e5e9, 0x010205),
+        (0x565b67, 0x010205),
+        (0xe2ecee, 0x191421),
+    ]);
+    for &(o, s) in &pairs {
+        for i in 0..=12 {
+            let a = 0.2 + 0.6 * i as f32 / 12.0;
+            measure(lerp(hexrgb(s), hexrgb(o), a));
         }
     }
     errs.sort_by(|a, b| a.total_cmp(b));
@@ -488,6 +500,37 @@ const SIGS: &[Sig] = &[
         near_black: (0.0, 10.0),
         bright: (2.0, 100.0),
     },
+    // `#0d1725` sits at the near-black threshold, so scene 4 has no near-black limit.
+    Sig { name: "4", t: 23.5, near: &[(0x0d1725, 95.0, 10.0), (0x392d3a, 25.0, 12.0)], near_black: (0.0, 100.0), bright: (0.0, 2.0) },
+    Sig {
+        name: "5",
+        t: 27.5,
+        near: &[(0x094287, 30.0, 12.0), (0x1f2636, 30.0, 12.0), (0x0d0e15, 25.0, 12.0)],
+        near_black: (3.0, 25.0),
+        bright: (1.0, 100.0),
+    },
+    Sig {
+        name: "6",
+        t: 33.0,
+        near: &[(0x0e448a, 30.0, 12.0), (0x222736, 30.0, 12.0), (0x477db9, 17.0, 10.0)],
+        near_black: (3.0, 25.0),
+        bright: (1.0, 100.0),
+    },
+    Sig {
+        name: "9",
+        t: 37.0,
+        near: &[(0x2d2633, 44.0, 12.0), (0x110d16, 39.0, 12.0), (0x61758e, 12.0, 10.0), (0xe3edef, 7.0, 10.0)],
+        near_black: (10.0, 35.0),
+        bright: (5.0, 100.0),
+    },
+    Sig { name: "10a", t: 39.6, near: &[(0x010205, 60.0, 15.0)], near_black: (45.0, 100.0), bright: (3.0, 100.0) },
+    Sig {
+        name: "10b",
+        t: 42.0,
+        near: &[(0x010205, 35.0, 15.0), (0x121b2d, 37.0, 12.0)],
+        near_black: (15.0, 55.0),
+        bright: (3.0, 100.0),
+    },
 ];
 
 /// Measure one signature on a run already positioned at its time.
@@ -533,12 +576,12 @@ fn signatures_at(grid: (i64, i64), names: &[&str]) {
 
 #[test]
 fn signatures_1080() {
-    signatures_at(GRID_1080, &["1a", "1b", "2a", "2b", "3"]);
+    signatures_at(GRID_1080, &["1a", "1b", "2a", "2b", "3", "4", "5", "6", "9", "10a", "10b"]);
 }
 
 #[test]
 fn signatures_4k() {
-    signatures_at(GRID_4K, &["1a", "3"]);
+    signatures_at(GRID_4K, &["1a", "3", "5", "9", "10b"]);
 }
 
 /// Dev aid (not run by default): write the emitted pixels at the given times
@@ -573,11 +616,11 @@ fn calibrate_distances() {
             let t = r.fx.time();
             if let Some(p) = &prev {
                 let (d, _) = frame_distance(p, &px);
-                let boundary = [6.0, 10.0, 12.5, 16.0, 22.0].iter().any(|b| (t - b).abs() < 0.6 / fps as f64);
+                let boundary = [6.0, 10.0, 12.5, 16.0, 22.0, 25.0, 30.0, 31.0, 35.0, 39.0, 45.0].iter().any(|b| (t - b).abs() < 0.6 / fps as f64);
                 if boundary {
                     eprintln!("fps {fps} t {t:.3} step {d:.2}");
                 }
-                if (10.0..10.5).contains(&t) || (12.4..12.6).contains(&t) || t >= 62.5 {
+                if (10.0..10.5).contains(&t) || (12.4..12.6).contains(&t) || (30.0..31.0).contains(&t) || t >= 62.5 {
                     worst_fade = worst_fade.max(d);
                 }
                 if d > worst_any.0 && !boundary {
@@ -601,7 +644,7 @@ const STEP_LIMIT: f64 = 12.0;
 const CUT_LIMIT: f64 = 25.0;
 
 /// Scenes still drawn as the flat placeholder; t1_4/t1_5 shrink this list.
-const PLACEHOLDER_SCENES: &[SceneId] = &[SceneId::S4, SceneId::S5, SceneId::S6, SceneId::S9, SceneId::S10, SceneId::S11, SceneId::B];
+const PLACEHOLDER_SCENES: &[SceneId] = &[SceneId::S11, SceneId::B];
 
 #[test]
 fn placeholders_listed_honestly() {
@@ -624,7 +667,7 @@ fn placeholders_listed_honestly() {
 #[test]
 fn cuts_are_cuts() {
     let mut r = run(GRID_1080, 60, 1);
-    for b in [6.0, 16.0, 22.0] {
+    for b in [6.0, 16.0, 22.0, 25.0, 35.0, 39.0, 45.0] {
         r.play_to(b - 1.0 / 60.0);
         let before = r.engine_pixels();
         r.frame().unwrap();
@@ -695,7 +738,15 @@ fn continuous_2a_2b_keeps_the_world() {
 fn hard_cuts_clear_the_pool() {
     let dt = 1.0 / 60.0;
     let mut r = run(GRID_1080, 60, 1);
-    for (b, owner) in [(6.0, SceneId::S1), (16.0, SceneId::S2), (22.0, SceneId::S3)] {
+    for (b, owner) in [
+        (6.0, SceneId::S1),
+        (16.0, SceneId::S2),
+        (22.0, SceneId::S3),
+        (25.0, SceneId::S4),
+        (35.0, SceneId::S6),
+        (39.0, SceneId::S9),
+        (45.0, SceneId::S10),
+    ] {
         r.play_to(b - dt);
         assert!(r.fx.live_particles() > 0, "particles alive before the cut at {b}");
         r.frame().unwrap();
@@ -759,7 +810,19 @@ fn gradient_primitives() {
 #[test]
 fn implemented_shots_move() {
     let mut r = run(GRID_1080, 60, 1);
-    for (a, b) in [(2.0, 2.5), (7.0, 7.5), (11.0, 11.5), (14.0, 14.5), (18.0, 18.5)] {
+    for (a, b) in [
+        (2.0, 2.5),
+        (7.0, 7.5),
+        (11.0, 11.5),
+        (14.0, 14.5),
+        (18.0, 18.5),
+        (23.0, 23.5),
+        (26.0, 26.5),
+        (32.0, 32.5),
+        (36.0, 36.5),
+        (40.0, 40.5),
+        (43.0, 43.5),
+    ] {
         r.play_to(a);
         let pa = r.engine_pixels();
         r.play_to(b);
@@ -815,4 +878,286 @@ fn palette_error_real_frames() {
     let p99 = errs[(errs.len() - 1) * 99 / 100];
     eprintln!("palette error (scenes 1–3): mean={mean:.2} p99={p99:.2}");
     assert!(mean <= 6.0 && p99 <= 20.0, "palette error mean {mean:.2} p99 {p99:.2}");
+}
+
+// ---- the space scenes (storyboard §2.4–2.8) ---------------------------------
+
+/// The pool never overflows (no spawn is dropped) over a whole run, and the
+/// two big systems peak near the storyboard's figures (3 000 and 3 100).
+#[test]
+fn particle_budget_holds() {
+    let mut r = run(GRID_1080, 60, 1);
+    let (mut max_all, mut max5, mut max10) = (0usize, 0usize, 0usize);
+    while r.frame().is_some() {
+        let n = r.fx.live_particles();
+        max_all = max_all.max(n);
+        match scene_at(r.fx.time()) {
+            SceneId::S5 => max5 = max5.max(n),
+            SceneId::S10 => max10 = max10.max(n),
+            _ => {}
+        }
+    }
+    eprintln!("live particles: max {max_all}, scene 5 {max5}, scene 10 {max10}");
+    assert!(max_all < POOL_CAPACITY, "the pool filled up ({max_all}): spawns were dropped");
+    assert!((1500..=4000).contains(&max5), "scene 5 peak {max5}");
+    assert!((1500..=4000).contains(&max10), "scene 10 peak {max10}");
+}
+
+/// The 1080p aspect A = cols·14 / (rows·32).
+const A_1080: f64 = 137.0 * 14.0 / (33.0 * 32.0);
+
+/// The booster's whole body leaves the frame by 29.8 s (not just its glow).
+#[test]
+fn booster_falls_away() {
+    let at = |t: f64| hot_staging::booster(t, A_1080);
+    assert!(at(27.39).is_none() && at(25.0).is_none(), "no booster before 27.4");
+    // Every corner moves down monotonically; the rotation reaches 10°.
+    let mut prev: Option<[(f64, f64); 4]> = None;
+    let mut k = 0;
+    loop {
+        let t = 27.4 + k as f64 / 120.0;
+        if t >= 29.8 {
+            break;
+        }
+        let b = at(t).expect("booster during the fall");
+        if let Some(p) = prev {
+            for (c, q) in b.corners.iter().zip(p) {
+                assert!(c.1 > q.1, "t {t:.3}: a corner moved up");
+            }
+        }
+        prev = Some(b.corners);
+        k += 1;
+    }
+    let last = at(29.8 - 1e-6).unwrap();
+    assert!((last.rotation.to_degrees() - 10.0).abs() < 0.1, "rotation {:.2}°", last.rotation.to_degrees());
+    // Still in view late in the shot; wholly below the frame from 29.75.
+    assert!(at(29.4).unwrap().corners.iter().any(|c| c.1 < 1.0), "the body is still visible at 29.4");
+    for t in [29.75, 29.77, 29.79, 29.799] {
+        let b = at(t).unwrap();
+        assert!(b.corners.iter().all(|c| c.1 >= 1.0), "t {t}: the body is not wholly below the frame: {:?}", b.corners);
+    }
+    assert!(at(29.8).is_none() && at(30.5).is_none(), "gone from 29.8");
+
+    // Render check on the same world state, with and without the booster:
+    // the difference is exactly its footprint.
+    let mut r = run(GRID_1080, 60, 1);
+    let diff_at = |r: &mut Run, t: f64| -> (Vec<(usize, usize)>, Pixbuf) {
+        r.play_to(t);
+        let (cols, rows) = r.fx.grid();
+        let world = r.fx.world().expect("world");
+        let mut with = Pixbuf::new(cols, rows * 2);
+        let mut without = Pixbuf::new(cols, rows * 2);
+        hot_staging::draw_opts(world, r.fx.time(), &mut with, true);
+        hot_staging::draw_opts(world, r.fx.time(), &mut without, false);
+        let mut d = Vec::new();
+        for y in 0..with.h {
+            for x in 0..with.w {
+                if with.px[y * with.w + x] != without.px[y * with.w + x] {
+                    d.push((x, y));
+                }
+            }
+        }
+        (d, with)
+    };
+    let inside = |poly: &[(f64, f64)], x: f64, y: f64| {
+        let mut c = false;
+        for i in 0..poly.len() {
+            let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+            if (p.1 > y) != (q.1 > y) && x < p.0 + (y - p.1) / (q.1 - p.1) * (q.0 - p.0) {
+                c = !c;
+            }
+        }
+        c
+    };
+    let (diff, buf) = diff_at(&mut r, 28.5);
+    let b = at(r.fx.time()).unwrap();
+    let (w, h) = (buf.w as f64, buf.h as f64);
+    // Corners and the glow disc in pixels (the camera only adds a small shake).
+    let shake_px = 0.003 * h * 1.2;
+    let poly: Vec<(f64, f64)> = b.corners.iter().map(|c| (c.0 * w, c.1 * h)).collect();
+    let (ex, ey) = (b.engine.0 * w, b.engine.1 * h);
+    let glow_rx = 0.03 * b.scale * buf.hx() + shake_px + 1.0;
+    let glow_ry = 0.03 * b.scale * buf.hy() + shake_px + 1.0;
+    let mut in_body = 0;
+    let mut body_px = 0;
+    for y in 0..buf.h {
+        for x in 0..buf.w {
+            if inside(&poly, x as f64 + 0.5, y as f64 + 0.5) {
+                body_px += 1;
+                if diff.contains(&(x, y)) {
+                    in_body += 1;
+                }
+            }
+        }
+    }
+    assert!(body_px > 0 && in_body as f64 >= 0.8 * body_px as f64, "the body is drawn at its corners: {in_body}/{body_px}");
+    for &(x, y) in &diff {
+        let (xc, yc) = (x as f64 + 0.5, y as f64 + 0.5);
+        let near_body = poly.iter().any(|p| (p.0 - xc).abs() < shake_px + 1.5 && (p.1 - yc).abs() < shake_px + 1.5)
+            || inside(&poly, xc, yc)
+            || {
+                // Grow the body by the shake for the containment test.
+                let c = poly.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0 / 4.0, a.1 + p.1 / 4.0));
+                let grown: Vec<(f64, f64)> = poly
+                    .iter()
+                    .map(|p| {
+                        let (dx, dy) = (p.0 - c.0, p.1 - c.1);
+                        let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                        (p.0 + dx / l * (shake_px + 1.5), p.1 + dy / l * (shake_px + 1.5))
+                    })
+                    .collect();
+                inside(&grown, xc, yc)
+            };
+        let in_glow = ((xc - ex) / glow_rx).powi(2) + ((yc - ey) / glow_ry).powi(2) <= 1.0;
+        assert!(near_body || in_glow, "pixel ({x}, {y}) depends on the booster layer but is outside its body and glow");
+    }
+    for t in [29.75, 29.8, 29.85] {
+        let (diff, _) = diff_at(&mut r, t);
+        assert!(diff.is_empty(), "t {t}: the booster layer still changes {} pixels", diff.len());
+    }
+    // No spark is spawned once the booster has gone.
+    r.play_to(29.95);
+    let t = r.fx.time();
+    let young = r.fx.particles().iter().filter(|p| p.owner == SceneId::S5.tag() && p.life <= 0.61 && p.age < t - 29.8).count();
+    assert_eq!(young, 0, "sparks spawned after 29.8");
+}
+
+#[test]
+fn seco_stars_and_bloom() {
+    assert_eq!(space::STARS, 60);
+    for i in 0..space::STARS {
+        let (u, v, ..) = space::star(i);
+        assert!((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v));
+        for k in 0..200 {
+            let l = space::star_luma(i, 39.0 + k as f64 * 0.03);
+            assert!(l > 0.0 && l <= 0.35, "star {i} luma {l:.3} > 0.35");
+        }
+    }
+    assert_eq!(seco::star_alpha(43.99), 0.0, "no stars before 44.0");
+    assert!(seco::star_alpha(44.9) > 0.9, "stars by 44.9");
+    let mut prev = 0.0;
+    for k in 0..=600 {
+        let t = 39.0 + k as f64 * 0.01;
+        let (r, _) = seco::bloom(t);
+        assert!(r >= prev, "bloom radius shrinks at {t:.2}");
+        prev = r;
+    }
+    let (r_peak, _) = seco::bloom(seco::BLOOM_START + seco::BLOOM_GROW);
+    assert!((r_peak - 0.60).abs() < 1e-9, "peak radius {r_peak}");
+    let (_, a_end) = seco::bloom(45.0);
+    assert!((a_end - 0.6).abs() < 1e-9, "haze alpha at 45.0 is {a_end}");
+}
+
+/// At 120 fps (the screensaver rate), consecutive ticks through the staging
+/// burst and its shake, the booster's fall and the bloom's fast start never
+/// jump: the mean step stays under the per-tick limit and the changed-pixel
+/// fraction never spikes far above its median.
+#[test]
+fn events_step_smoothly() {
+    let fps = 120;
+    let mut r = run(GRID_1080, fps, 1);
+    for (a, b) in [(25.95, 26.6), (27.4, 29.8), (39.05, 40.0)] {
+        r.play_to(a - 1.0 / fps as f64);
+        let mut prev = r.engine_pixels();
+        let mut steps = Vec::new();
+        while r.fx.time() < b {
+            r.frame().unwrap();
+            let px = r.engine_pixels();
+            let changed = px.iter().zip(&prev).filter(|(x, y)| x != y).count() as f64 / px.len() as f64;
+            let (d, _) = frame_distance(&prev, &px);
+            steps.push((r.fx.time(), d, changed));
+            prev = px;
+        }
+        let mut fr: Vec<f64> = steps.iter().map(|s| s.2).collect();
+        fr.sort_by(|x, y| x.total_cmp(y));
+        let median = fr[fr.len() / 2];
+        let worst_d = steps.iter().map(|s| s.1).fold(0.0, f64::max);
+        let worst_c = fr.last().copied().unwrap();
+        let mut by_step = steps.clone();
+        by_step.sort_by(|x, y| y.1.total_cmp(&x.1));
+        let top: Vec<String> = by_step.iter().take(3).map(|s| format!("{:.3}s {:.2}", s.0, s.1)).collect();
+        eprintln!("{a}–{b}: worst step {worst_d:.2} ({}), changed median {:.3} max {:.3}", top.join(", "), median, worst_c);
+        for &(t, d, c) in &steps {
+            assert!(d < STEP_LIMIT, "t {t:.3}: step {d:.2} ≥ {STEP_LIMIT}");
+            // A floor of 2 % keeps a near-static window (median ≈ 0) from
+            // flagging ordinary particle motion as a spike.
+            assert!(c <= 3.0 * median + 0.02, "t {t:.3}: {:.1}% of pixels changed (median {:.1}%)", 100.0 * c, 100.0 * median);
+        }
+    }
+}
+
+/// Screen aspects A = cols·14 / (rows·32) to check geometry on: 4:3-ish,
+/// 2560×1440, 4K, 1080p and a 274×33-cell ultrawide.
+const ASPECTS: [f64; 5] = [
+    100.0 * 14.0 / (33.0 * 32.0),
+    182.0 * 14.0 / (45.0 * 32.0),
+    274.0 * 14.0 / (67.0 * 32.0),
+    137.0 * 14.0 / (33.0 * 32.0),
+    274.0 * 14.0 / (33.0 * 32.0),
+];
+
+/// Scene 9's sun sits in black space right of the Earth (storyboard §2.7),
+/// whatever the screen's shape: the colour signatures cannot see this.
+#[test]
+fn ship_over_earth_sun_is_in_space() {
+    for a in ASPECTS {
+        let ((cx, cy), r) = over_earth::earth(a);
+        let (su, sv) = over_earth::SUN_AT;
+        let d = ((su * a - cx).powi(2) + (sv - cy).powi(2)).sqrt() - r;
+        assert!(d >= over_earth::SUN_CORE_R, "A {a:.3}: the sun's core is {d:.3} H from the Earth's edge (inside or touching it)");
+        // The Earth is on the left of the sun: the edge point level with the
+        // sun is further left.
+        let edge_u = (cx + (r * r - (sv - cy).powi(2)).max(0.0).sqrt()) / a;
+        assert!(edge_u < su, "A {a:.3}: the Earth's edge ({edge_u:.3}) is not left of the sun ({su})");
+    }
+}
+
+/// SECO's limb is a thin arc through its two ends on the top edge, dipping
+/// `LIMB_DEPTH` at any aspect, and on an ultrawide grid nothing below it is
+/// drawn in the limb colour.
+#[test]
+fn seco_limb_arc_holds_on_any_aspect() {
+    for a in ASPECTS {
+        let ((cx, cy), r) = seco::limb_arc(a);
+        for (u, v) in seco::LIMB_ENDS {
+            let d = ((u * a - cx).powi(2) + (v - cy).powi(2)).sqrt();
+            assert!((d - r).abs() < 1e-9, "A {a:.3}: the arc misses its end ({u}, {v}) by {:.4} H", d - r);
+        }
+        let lowest = cy + r;
+        assert!((lowest - seco::LIMB_DEPTH).abs() < 1e-9 && lowest < 0.06, "A {a:.3}: the arc dips to v {lowest:.3}");
+    }
+    // Render probe on the ultrawide grid, before the bloom: outside the hull
+    // and the engine's plume, no pixel below v = 0.07 is near the limb colour.
+    let mut r = run((274, 33), 60, 1);
+    r.play_to(39.0);
+    let buf = r.fx.render_only(SceneId::S10);
+    let (w, h) = (buf.w as f64, buf.h as f64);
+    let hull: Vec<(f64, f64)> = seco::HULL_POLY.iter().map(|p| (p.0 * w, p.1 * h)).collect();
+    let inside = |x: f64, y: f64| {
+        let mut c = false;
+        for i in 0..hull.len() {
+            let (p, q) = (hull[i], hull[(i + 1) % hull.len()]);
+            if (p.1 > y) != (q.1 > y) && x < p.0 + (y - p.1) / (q.1 - p.1) * (q.0 - p.0) {
+                c = !c;
+            }
+        }
+        c
+    };
+    let (ax, ay) = (seco::APEX.0 * w, seco::APEX.1 * h);
+    let mut stray = 0;
+    for y in 0..buf.h {
+        for x in 0..buf.w {
+            let (xc, yc) = (x as f64 + 0.5, y as f64 + 0.5);
+            let near_plume = ((xc - ax) / (0.12 * buf.hx())).powi(2) + ((yc - ay) / (0.12 * buf.hy())).powi(2) <= 1.0;
+            if yc / h < 0.07 || inside(xc, yc) || near_plume {
+                continue;
+            }
+            let c = buf.px[y * buf.w + x];
+            let px = [c[0].clamp(0.0, 255.0) as u8, c[1].clamp(0.0, 255.0) as u8, c[2].clamp(0.0, 255.0) as u8];
+            if dist(px, hexrgb(0x6f95ab)) <= 48.0 {
+                stray += 1;
+            }
+        }
+    }
+    assert_eq!(stray, 0, "{stray} limb-coloured pixels below the thin top arc on the ultrawide grid");
 }

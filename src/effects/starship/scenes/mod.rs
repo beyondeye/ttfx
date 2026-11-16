@@ -5,8 +5,14 @@
 //! and the time, so `--start-at` can fast-forward by stepping alone.
 
 pub mod ascent;
+pub mod coast;
+pub mod high_altitude;
+pub mod hot_staging;
 pub mod onboard;
+pub mod over_earth;
 pub mod pad;
+pub mod seco;
+pub mod space;
 
 use crate::utils::rng::Rng;
 
@@ -28,9 +34,17 @@ pub enum Slot {
     S2Edge,
     S3Exhaust,
     S3Debris,
+    S4Plume,
+    S5Burst,
+    S5Sparks,
+    S5Flakes,
+    S6Flakes,
+    S9Ice,
+    S10Haze,
+    S10Ice,
 }
 
-const SLOTS: usize = 8;
+const SLOTS: usize = 16;
 
 pub struct World {
     pub pool: Pool,
@@ -74,6 +88,11 @@ impl World {
             SceneId::S1 => pad::step(self, rng, t1, dt),
             SceneId::S2 => ascent::step(self, rng, t1, dt),
             SceneId::S3 => onboard::step(self, rng, t1, dt),
+            SceneId::S4 => high_altitude::step(self, rng, t1, dt),
+            SceneId::S5 => hot_staging::step(self, rng, t1, dt),
+            SceneId::S6 => coast::step(self, rng, t1, dt),
+            SceneId::S9 => over_earth::step(self, rng, t1, dt),
+            SceneId::S10 => seco::step(self, rng, t1, dt),
             _ => {}
         }
     }
@@ -88,6 +107,11 @@ impl World {
             SceneId::S1 => pad::draw(self, t, buf),
             SceneId::S2 => ascent::draw(self, t, buf),
             SceneId::S3 => onboard::draw(self, t, buf),
+            SceneId::S4 => high_altitude::draw(self, t, buf),
+            SceneId::S5 => hot_staging::draw(self, t, buf),
+            SceneId::S6 => coast::draw(self, t, buf),
+            SceneId::S9 => over_earth::draw(self, t, buf),
+            SceneId::S10 => seco::draw(self, t, buf),
             _ => draw_placeholder(buf),
         }
     }
@@ -107,6 +131,29 @@ impl World {
     pub fn spawn(&mut self, rng: &mut Rng, slot: Slot, spec: &EmitSpec, x: f64, y: f64, owner: SceneId, dt: f64, rate: f64) {
         let n = super::particles::due(&mut self.acc[slot as usize], rate, dt);
         self.pool.spawn(rng, spec, x, y, owner.tag(), n);
+    }
+
+    /// Spawn from `spec` at uniformly random points of the normalised
+    /// rectangle `us × vs`. The position is drawn for every due spawn, also
+    /// when the pool is full, so the RNG stream never depends on the load.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_area(
+        &mut self,
+        rng: &mut Rng,
+        slot: Slot,
+        spec: &EmitSpec,
+        us: (f64, f64),
+        vs: (f64, f64),
+        owner: SceneId,
+        dt: f64,
+        rate: f64,
+    ) {
+        let n = super::particles::due(&mut self.acc[slot as usize], rate, dt);
+        for _ in 0..n {
+            let u = rng.uniform(us.0, us.1);
+            let v = rng.uniform(vs.0, vs.1);
+            self.pool.spawn(rng, spec, u * self.aspect, v, owner.tag(), 1);
+        }
     }
 }
 

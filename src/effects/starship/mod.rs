@@ -288,6 +288,11 @@ impl Starship {
         self.world.is_some() || !self.visuals.is_empty() || !self.cur.px.is_empty()
     }
 
+    /// The simulation state (read-only; `None` once the effect has ended).
+    pub fn world(&self) -> Option<&World> {
+        self.world.as_ref()
+    }
+
     /// The last frame's state drawn with one scene's layer only (no mix):
     /// the endpoints a cross-fade must match.
     pub fn render_only(&mut self, scene: SceneId) -> &Pixbuf {

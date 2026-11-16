@@ -196,11 +196,54 @@ pub const RAMPS_S3: &[Ramp] = &[
     ramp(0xdf9e54, 0x999fa8, 6),
 ];
 
-/// Every scene's declared ramps. t1_4/t1_5 append their scenes here.
-pub const ALL_RAMPS: &[&[Ramp]] = &[RAMPS_S1, RAMPS_S2, RAMPS_S3];
+/// Scene 4 (high altitude): the navy sky into the plume glow, the plume, the cone.
+pub const RAMPS_S4: &[Ramp] = &[
+    ramp(0x0d1725, 0x392d3a, 6),
+    ramp(0x392d3a, 0x694f5c, 4),
+    ramp(0x694f5c, 0xe6e1db, 6),
+    ramp(0x0d1725, 0x414550, 4),
+];
+
+/// Scene 5 (hot staging): sky, atmosphere band, vapour, hull shadow, booster glow.
+pub const RAMPS_S5: &[Ramp] = &[
+    ramp(0x313a56, 0x094287, 4),
+    ramp(0x094287, 0x5a8bbf, 6),
+    ramp(0x5a8bbf, 0xc9d2d9, 4),
+    ramp(0x1f2636, 0x0d0e15, 4),
+    ramp(0xe7bb68, 0x8d7581, 3),
+];
+
+/// Scene 6 (coast): sky, limb band, glare, hull shadow.
+pub const RAMPS_S6: &[Ramp] = &[
+    ramp(0x0a397b, 0x0e448a, 3),
+    ramp(0x0e448a, 0x477db9, 6),
+    ramp(0x477db9, 0x5897d9, 3),
+    ramp(0x5897d9, 0xb8c9d5, 4),
+    ramp(0x222736, 0x0d0f16, 4),
+];
+
+/// Scene 9 (ship over Earth): plum hull, ocean, clouds, the sun's glare into space.
+pub const RAMPS_S9: &[Ramp] = &[
+    ramp(0x2d2633, 0x110d16, 4),
+    ramp(0x191421, 0x61758e, 4),
+    ramp(0x61758e, 0x99abb7, 4),
+    ramp(0xddedf7, 0x191421, 6),
+    ramp(0x2d2633, 0x3d3446, 3),
+];
+
+/// Scene 10 (SECO): the haze from black space to its bright core, the grey hull.
+pub const RAMPS_S10: &[Ramp] = &[
+    ramp(0x010205, 0x121b2d, 4),
+    ramp(0x121b2d, 0x565b67, 5),
+    ramp(0x565b67, 0xd5e5e9, 6),
+    ramp(0x444348, 0x010205, 4),
+];
+
+/// Every scene's declared ramps. t1_5 appends scene 11 and the branding here.
+pub const ALL_RAMPS: &[&[Ramp]] = &[RAMPS_S1, RAMPS_S2, RAMPS_S3, RAMPS_S4, RAMPS_S5, RAMPS_S6, RAMPS_S9, RAMPS_S10];
 
 const GREY_STEPS: usize = 16;
-const CUBE_LEVELS: usize = 4;
+const CUBE_LEVELS: usize = 3;
 
 fn rgb_of(hex: u32) -> [u8; 3] {
     [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]

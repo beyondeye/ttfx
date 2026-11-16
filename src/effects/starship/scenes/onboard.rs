@@ -72,14 +72,14 @@ pub fn step(world: &mut World, rng: &mut Rng, _t: f64, dt: f64) {
     world.spawn(rng, Slot::S3Debris, &debris_spec(), x, y, SceneId::S3, dt, 60.0);
 }
 
-fn to_px(buf: &Pixbuf, cam: &Camera, pts: &[(f64, f64)], out: &mut [(f64, f64)]) {
+pub(super) fn to_px(buf: &Pixbuf, cam: &Camera, pts: &[(f64, f64)], out: &mut [(f64, f64)]) {
     for (o, &(u, v)) in out.iter_mut().zip(pts) {
         *o = cam.px(buf, u, v);
     }
 }
 
 /// Inside test for a convex-ish polygon in pixel space (even-odd).
-fn inside(pts: &[(f64, f64)], x: f64, y: f64) -> bool {
+pub(super) fn inside(pts: &[(f64, f64)], x: f64, y: f64) -> bool {
     let mut c = false;
     for i in 0..pts.len() {
         let (p, q) = (pts[i], pts[(i + 1) % pts.len()]);
@@ -91,8 +91,9 @@ fn inside(pts: &[(f64, f64)], x: f64, y: f64) -> bool {
 }
 
 /// Whether pixel (x, y) lies on a seam of the hex tile grid (0.03 H tiles).
-fn on_seam(buf: &Pixbuf, x: f64, y: f64) -> bool {
-    let size = 0.03 * buf.hy();
+/// `h` is the pixbuf height in pixels (one H vertically).
+pub(super) fn on_seam(h: usize, x: f64, y: f64) -> bool {
+    let size = 0.03 * h as f64;
     let (sx, sy) = (size * 1.0, size * 0.866);
     let row = (y / sy).floor();
     let mut best = (f64::MAX, f64::MAX);
@@ -111,7 +112,7 @@ fn on_seam(buf: &Pixbuf, x: f64, y: f64) -> bool {
         }
     }
     // Seams are 1 px at the 137×66 reference grid; scale with the grid.
-    best.1 - best.0 < 0.9 * buf.h as f64 / 66.0
+    best.1 - best.0 < 0.9 * h as f64 / 66.0
 }
 
 pub fn draw(world: &World, t: f64, buf: &mut Pixbuf) {
@@ -143,7 +144,7 @@ pub fn draw(world: &World, t: f64, buf: &mut Pixbuf) {
             }
             if inside(&hull, xc, yc) {
                 let dark = inside(&band, xc, yc);
-                let seam = on_seam(buf, xc - cam.shake.0 * buf.hx(), yc - cam.shake.1 * buf.hy());
+                let seam = on_seam(buf.h, xc - cam.shake.0 * buf.hx(), yc - cam.shake.1 * buf.hy());
                 c = match (dark, seam) {
                     (false, false) => HULL,
                     (false, true) if (x + y) % 2 == 0 => HULL_SEAM,
