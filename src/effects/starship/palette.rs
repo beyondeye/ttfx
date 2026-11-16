@@ -5,13 +5,14 @@
 //! the effect on every loop. Emitting free RGB would therefore grow memory
 //! without bound. Instead every fg and bg is an entry of this palette `P`:
 //! it is built from constants only (no seed, no grid), so the reachable set
-//! of appearances is at most `|P|²` (one symbol, `▀`) for any seed and any
-//! number of loops. `tests/starship_pool_ceiling.rs` saturates that whole set
-//! and measures the bytes it costs.
+//! of `▀` appearances is at most `|P|²` for any seed and any number of loops.
+//! The branding's glyph cells (text.rs) use small fixed subsets of P under
+//! their own budget. `tests/starship_pool_ceiling.rs` saturates both and
+//! measures the bytes they cost.
 //!
 //! Contents: the storyboard's sampled colours (aidocs/starship/storyboard.md),
-//! the gradient ramps each scene declares, a grey ramp and a coarse cube for
-//! blends that fall between them.
+//! the gradient ramps each scene declares, the branding text ramp and a grey
+//! ramp for blends that fall between them.
 
 use std::sync::OnceLock;
 
@@ -19,14 +20,14 @@ use crate::utils::graphics::Color;
 
 /// Upper bound on `|P|`. The worst case is the screensaver's rebuild: the
 /// replacement is built while the ended instance (and the full pool) still
-/// exist. Measured: about 318 B per P×P pair plus two engine instances at 4K
-/// (about 11.8 MB each), so 340 entries is about 62 MB, under the 64 MB gate.
+/// exist. Measured: about 320 B per P×P pair plus two engine instances at 4K
+/// (about 12 MB each), plus the branding budget (text.rs, ≈ 3.3 MB) or, for
+/// a full 4K grid of distinct input symbols, the engine's own per-symbol
+/// visuals (≈ 4.5 MB). At |P| = 317 the worst case measures 62.9 MB, under
+/// the 64 MB gate, so the cap leaves 3 entries of headroom.
 /// `tests/starship_pool_ceiling.rs` measures that lifecycle with the real
 /// palette and is the authority; this cap only fails fast at build.
-pub const P_CAP: usize = 340;
-
-/// The placeholder colour of scenes that are not implemented yet.
-pub const PLACEHOLDER: [u8; 3] = [0xff, 0x00, 0xff];
+pub const P_CAP: usize = 320;
 
 /// Index into the palette. The only colour type the emitter accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,7 +140,6 @@ const STORYBOARD: &[u32] = &[
     0xf3efe6,
     0xfafaf7,
     0xfafcfb,
-    0xff00ff,
 ];
 
 /// A gradient a scene draws: `steps` evenly spaced colours from `a` to `b`
@@ -172,26 +172,26 @@ pub const RAMPS_S1: &[Ramp] = &[
 pub const RAMPS_S2: &[Ramp] = &[
     ramp(0x2c507a, 0x305581, 6),
     ramp(0x305581, 0x3b6187, 6),
-    ramp(0x3b6187, 0x4f6271, 8),
-    ramp(0xd0b3bd, 0xa692a0, 6),
+    ramp(0x3b6187, 0x4f6271, 6),
+    ramp(0xd0b3bd, 0xa692a0, 4),
     ramp(0xc3b2b9, 0x7d8488, 6),
     ramp(0x1f3f66, 0x2c507a, 6),
-    ramp(0x3b6187, 0x7b8894, 8),
-    ramp(0x7b8894, 0x4f6271, 6),
+    ramp(0x3b6187, 0x7b8894, 6),
+    ramp(0x7b8894, 0x4f6271, 4),
     ramp(0x4f6271, 0x1e3550, 6),
     ramp(0x1e3550, 0x272929, 4),
 ];
 
 /// Scene 3 (onboard) gradients: sea, land, hull and the engine fire.
 pub const RAMPS_S3: &[Ramp] = &[
-    ramp(0x255687, 0x44709b, 8),
+    ramp(0x255687, 0x44709b, 6),
     ramp(0x44709b, 0x3b70a7, 4),
     ramp(0x355e8e, 0x44709b, 4),
-    ramp(0x5d6570, 0x44709b, 8),
+    ramp(0x5d6570, 0x44709b, 6),
     ramp(0x262734, 0x454448, 6),
     ramp(0x454448, 0x5d6570, 6),
     ramp(0x525f6e, 0x3a3a42, 3),
-    ramp(0x255687, 0x497197, 8),
+    ramp(0x255687, 0x497197, 6),
     ramp(0xf1e9d3, 0xdf9e54, 6),
     ramp(0xdf9e54, 0x999fa8, 6),
 ];
@@ -216,7 +216,7 @@ pub const RAMPS_S5: &[Ramp] = &[
 /// Scene 6 (coast): sky, limb band, glare, hull shadow.
 pub const RAMPS_S6: &[Ramp] = &[
     ramp(0x0a397b, 0x0e448a, 3),
-    ramp(0x0e448a, 0x477db9, 6),
+    ramp(0x0e448a, 0x477db9, 5),
     ramp(0x477db9, 0x5897d9, 3),
     ramp(0x5897d9, 0xb8c9d5, 4),
     ramp(0x222736, 0x0d0f16, 4),
@@ -239,13 +239,42 @@ pub const RAMPS_S10: &[Ramp] = &[
     ramp(0x444348, 0x010205, 4),
 ];
 
-/// Every scene's declared ramps. t1_5 appends scene 11 and the branding here.
-pub const ALL_RAMPS: &[&[Ramp]] = &[RAMPS_S1, RAMPS_S2, RAMPS_S3, RAMPS_S4, RAMPS_S5, RAMPS_S6, RAMPS_S9, RAMPS_S10];
+/// Scene 11 (catch): overcast sky, ground, tower lattice, ship steel, steam.
+pub const RAMPS_S11: &[Ramp] = &[
+    ramp(0xaaa197, 0xc3b8ac, 3),
+    ramp(0xa8a69e, 0x9f9c94, 3),
+    ramp(0x74695c, 0x463f33, 3),
+    ramp(0x2d2c22, 0x37352b, 3),
+    ramp(0x9a8d7c, 0xc7bbab, 4),
+    ramp(0xc4bcb0, 0xafaaa1, 3),
+    ramp(0xc8bcad, 0x9e9786, 4),
+    ramp(0x56544a, 0xa3a39b, 4),
+];
+
+/// The branding text ramp F (`text.rs`): dim → smoke → text colour. Every
+/// step is an exact palette entry.
+pub const RAMPS_TEXT: &[Ramp] = &[ramp(0x6e6c66, 0xafaca3, 4), ramp(0xafaca3, 0xf3efe6, 5)];
+
+/// Every scene's declared ramps, plus the branding text ramp.
+pub const ALL_RAMPS: &[&[Ramp]] =
+    &[RAMPS_S1, RAMPS_S2, RAMPS_S3, RAMPS_S4, RAMPS_S5, RAMPS_S6, RAMPS_S9, RAMPS_S10, RAMPS_S11, RAMPS_TEXT];
 
 const GREY_STEPS: usize = 16;
-const CUBE_LEVELS: usize = 3;
 
-fn rgb_of(hex: u32) -> [u8; 3] {
+/// The colours a ramp contributes to the palette, in order (both ends included).
+pub fn ramp_colors(r: &Ramp) -> Vec<[u8; 3]> {
+    let (a, b) = (rgb_of(r.a), rgb_of(r.b));
+    let n = r.steps.max(2);
+    (0..n)
+        .map(|i| {
+            let w = i as f64 / (n - 1) as f64;
+            [lerp_u8(a[0], b[0], w), lerp_u8(a[1], b[1], w), lerp_u8(a[2], b[2], w)]
+        })
+        .collect()
+}
+
+/// RGB bytes of a `0xrrggbb` constant.
+pub fn rgb_of(hex: u32) -> [u8; 3] {
     [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
 }
 
@@ -267,25 +296,12 @@ impl Palette {
         rgb.extend(STORYBOARD.iter().map(|&h| rgb_of(h)));
         for ramps in ALL_RAMPS {
             for r in ramps.iter() {
-                let (a, b) = (rgb_of(r.a), rgb_of(r.b));
-                let n = r.steps.max(2);
-                for i in 0..n {
-                    let w = i as f64 / (n - 1) as f64;
-                    rgb.push([lerp_u8(a[0], b[0], w), lerp_u8(a[1], b[1], w), lerp_u8(a[2], b[2], w)]);
-                }
+                rgb.extend(ramp_colors(r));
             }
         }
         for i in 0..GREY_STEPS {
             let g = lerp_u8(0, 255, i as f64 / (GREY_STEPS - 1) as f64);
             rgb.push([g, g, g]);
-        }
-        for r in 0..CUBE_LEVELS {
-            for g in 0..CUBE_LEVELS {
-                for b in 0..CUBE_LEVELS {
-                    let l = |i: usize| lerp_u8(0, 255, i as f64 / (CUBE_LEVELS - 1) as f64);
-                    rgb.push([l(r), l(g), l(b)]);
-                }
-            }
         }
         rgb.sort_unstable();
         rgb.dedup();

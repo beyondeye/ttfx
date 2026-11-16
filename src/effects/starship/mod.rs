@@ -11,12 +11,19 @@
 //!
 //! The fixed palette is what keeps memory bounded: ttfx retains every distinct
 //! appearance for the life of the process, and P×P is the most this effect can
-//! ever emit (see palette.rs and tests/starship_pool_ceiling.rs).
+//! ever emit as `▀` cells (see palette.rs and tests/starship_pool_ceiling.rs).
+//!
+//! The branding reveal (58–64 s) also draws the input characters with their
+//! own symbols ("glyph cells"). Their colours come from the small fixed sets of
+//! `text.rs`, under one budget that also counts the engine's per-symbol
+//! default visuals, so the bound stays a constant for any input (see text.rs
+//! for the supported input and the overflow rule).
 
 pub mod palette;
 pub mod particles;
 pub mod raster;
 pub mod scenes;
+pub mod text;
 pub mod timeline;
 
 use clap::Args;
@@ -35,8 +42,17 @@ use raster::Pixbuf;
 use scenes::World;
 use timeline::{blend_weight, scene_at, Blend, SceneId, TOTAL_SECONDS};
 
-/// The only symbol the effect draws: upper half block (fg = top pixel).
+/// The symbol of every scene cell: upper half block (fg = top pixel).
 pub const HALF_BLOCK: &str = "▀";
+
+/// Which symbol an emitted appearance uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Glyph {
+    /// `▀`: a scene cell (fg = top pixel, bg = bottom pixel).
+    HalfBlock,
+    /// The character's own input symbol (branding glyph cells only).
+    Input,
+}
 
 pub const DURATION_SCALE_MIN: f64 = 0.25;
 pub const DURATION_SCALE_MAX: f64 = 4.0;
@@ -92,6 +108,9 @@ impl Default for StarshipConfig {
 
 const NO_CHAR: CharId = CharId(u32::MAX);
 const NO_KEY: u32 = u32::MAX;
+const NO_SLOT: u32 = u32::MAX;
+/// Shadow-key flag of a glyph cell (palette indices fit in 15 bits).
+const GLYPH_BIT: u32 = 1 << 31;
 
 pub struct Starship {
     config: StarshipConfig,
@@ -118,6 +137,14 @@ pub struct Starship {
     /// adds no appearances; it skips the engine's per-call lookup on a hit.
     visuals: Vec<Option<Visual>>,
     cache_ok: bool,
+    /// Cell index → branding text slot (`World::text`), or `NO_SLOT`.
+    text_slot: Vec<u32>,
+    /// Cell index → its glyph symbol's number (glyph cells only).
+    text_sym: Vec<u32>,
+    /// (symbol, fg, bg) → the visual `emit_appearance` interned for it (as
+    /// `visuals` for `▀`: only pointers already in the engine's pool).
+    glyph_visuals: std::collections::HashMap<(u32, u16, u16), Visual>,
+    text_plan: text::TextPlan,
 }
 
 impl Starship {
@@ -140,6 +167,10 @@ impl Starship {
             last_t: 0.0,
             visuals: Vec::new(),
             cache_ok: false,
+            text_slot: Vec::new(),
+            text_sym: Vec::new(),
+            glyph_visuals: std::collections::HashMap::new(),
+            text_plan: text::TextPlan { tier: 0, k_symbols: 0 },
         }
     }
 
@@ -173,6 +204,7 @@ impl Starship {
                 self.cur.mix_with(&self.alt, w as f32);
             }
         }
+
     }
 
     fn emit(&mut self, ctx: &mut EngineCtx) {
@@ -180,6 +212,9 @@ impl Starship {
         let half = (pal.len() / 2) as u16;
         let flip = (self.tick & 1) as u16 * half;
         let w = self.cur.w;
+        let tier = self.text_plan.tier;
+        let s_max = text::TIERS[tier].states();
+        let world = self.world.as_ref().expect("built");
         self.changed = 0;
         for row in 0..self.rows {
             for col in 0..self.cols {
@@ -188,24 +223,56 @@ impl Starship {
                 if id == NO_CHAR {
                     continue;
                 }
-                let mut fg = pal.nearest(self.cur.px[2 * row * w + col]);
-                let mut bg = pal.nearest(self.cur.px[(2 * row + 1) * w + col]);
-                if self.stress {
-                    // Consecutive ticks use disjoint palette halves: every cell changes.
-                    fg = PalIdx(fg.0 % half + flip);
-                    bg = PalIdx(bg.0 % half + flip);
-                }
-                let key = (u32::from(fg.0) << 16) | u32::from(bg.0);
+                let top = self.cur.px[2 * row * w + col];
+                let bottom = self.cur.px[(2 * row + 1) * w + col];
+                let slot = self.text_slot[idx];
+                let s = if slot == NO_SLOT || self.stress { 0 } else { world.glyph_state(slot as usize, self.tick, self.dt, s_max) };
+                let (glyph, fg, bg) = if s == 0 {
+                    let mut fg = pal.nearest(top);
+                    let mut bg = pal.nearest(bottom);
+                    if self.stress {
+                        // Consecutive ticks use disjoint palette halves: every cell changes.
+                        fg = PalIdx(fg.0 % half + flip);
+                        bg = PalIdx(bg.0 % half + flip);
+                    }
+                    (Glyph::HalfBlock, fg, bg)
+                } else {
+                    let g = world.text[slot as usize].plate.unwrap_or_else(|| text::plate_of(tier, top, bottom));
+                    match text::cell_state(tier, s, top, bottom, g) {
+                        text::CellDraw::HalfBlock(f, b) => (Glyph::HalfBlock, f, b),
+                        text::CellDraw::Glyph(f, b) => {
+                            debug_assert!(text::is_reachable(tier, f, b), "glyph pair outside the tier's set");
+                            (Glyph::Input, f, b)
+                        }
+                    }
+                };
+                let flag = if glyph == Glyph::Input { GLYPH_BIT } else { 0 };
+                let key = flag | (u32::from(fg.0) << 16) | u32::from(bg.0);
                 if self.shadow[idx] != key {
                     self.shadow[idx] = key;
                     self.changed += 1;
+                    if glyph == Glyph::Input {
+                        let gk = (self.text_sym[idx], fg.0, bg.0);
+                        match self.glyph_visuals.get(&gk) {
+                            Some(&visual) if self.cache_ok => {
+                                ctx.terminal.arena[id.0 as usize].animation.current_character_visual = visual;
+                            }
+                            _ => {
+                                emit_appearance(ctx, id, Glyph::Input, fg, bg);
+                                if self.cache_ok {
+                                    self.glyph_visuals.insert(gk, ctx.terminal.arena[id.0 as usize].animation.current_character_visual);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let slot = fg.0 as usize * pal.len() + bg.0 as usize;
                     match self.visuals.get(slot).copied().flatten() {
                         Some(visual) => {
                             ctx.terminal.arena[id.0 as usize].animation.current_character_visual = visual;
                         }
                         _ => {
-                            emit_appearance(ctx, id, fg, bg);
+                            emit_appearance(ctx, id, Glyph::HalfBlock, fg, bg);
                             if self.cache_ok {
                                 self.visuals[slot] =
                                     Some(ctx.terminal.arena[id.0 as usize].animation.current_character_visual);
@@ -223,8 +290,40 @@ impl Starship {
         self.visuals = Vec::new();
         self.shadow = Vec::new();
         self.ids = Vec::new();
+        self.text_slot = Vec::new();
+        self.text_sym = Vec::new();
+        self.glyph_visuals = std::collections::HashMap::new();
         self.cur = Pixbuf::new(0, 0);
         self.alt = Pixbuf::new(0, 0);
+    }
+
+    /// Pick the branding glyph cells: in-canvas input characters whose symbol
+    /// is among the plan's `k` most frequent (text.rs).
+    fn setup_text(&mut self, ctx: &EngineCtx, world: &mut World) {
+        let cells = self.cols * self.rows;
+        self.text_slot = vec![NO_SLOT; cells];
+        let arena = &ctx.terminal.arena;
+        let n_distinct = text::count_symbols(arena.iter().map(|c| c.input_symbol.as_str())).len();
+        let input_only = CharacterFilter { input_chars: true, inner_fill_chars: false, outer_fill_chars: false, added_chars: false };
+        let inputs: std::collections::HashSet<CharId> = ctx.terminal.collect_characters(input_only).into_iter().collect();
+        let in_canvas: Vec<usize> = (0..cells).filter(|&i| self.ids[i] != NO_CHAR && inputs.contains(&self.ids[i])).collect();
+        let counts = text::count_symbols(in_canvas.iter().map(|&i| arena[self.ids[i].0 as usize].input_symbol.as_str()));
+        self.text_plan = text::plan_for(n_distinct, counts.len());
+        let keep: std::collections::HashSet<String> = text::glyph_symbols(&counts, self.text_plan.k_symbols).into_iter().collect();
+        self.text_sym = vec![0; cells];
+        let mut sym_no: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut uv = Vec::new();
+        for i in in_canvas {
+            let sym = &arena[self.ids[i].0 as usize].input_symbol;
+            if keep.contains(sym) {
+                let next = sym_no.len() as u32;
+                self.text_sym[i] = *sym_no.entry(sym.clone()).or_insert(next);
+                self.text_slot[i] = uv.len() as u32;
+                let (col, row) = (i % self.cols, i / self.cols);
+                uv.push(((col as f64 + 0.5) / self.cols as f64, (row as f64 + 0.5) / self.rows as f64));
+            }
+        }
+        world.set_text(uv, (1.0 / self.cols as f64, 1.0 / self.rows as f64), self.text_plan.tier);
     }
 
     // ---- test hooks -------------------------------------------------------
@@ -250,6 +349,8 @@ impl Starship {
     }
 
     /// The emitted pixel colours of the last frame (row-major, 2 per cell).
+    /// A glyph cell reports its bg in both halves: this view is for the scene
+    /// metrics; read the engine's cells for what a glyph shows.
     pub fn pixels(&self) -> Vec<[u8; 3]> {
         let pal = palette();
         if self.shadow.is_empty() {
@@ -262,8 +363,10 @@ impl Starship {
                 if key == NO_KEY {
                     continue;
                 }
-                out[2 * row * self.cols + col] = pal.rgb_of(PalIdx((key >> 16) as u16));
-                out[(2 * row + 1) * self.cols + col] = pal.rgb_of(PalIdx(key as u16));
+                let bg = pal.rgb_of(PalIdx(key as u16));
+                let fg = if key & GLYPH_BIT != 0 { bg } else { pal.rgb_of(PalIdx(((key >> 16) & 0x7fff) as u16)) };
+                out[2 * row * self.cols + col] = fg;
+                out[(2 * row + 1) * self.cols + col] = bg;
             }
         }
         out
@@ -293,6 +396,48 @@ impl Starship {
         self.world.as_ref()
     }
 
+    /// The branding text plan: tier and number of glyph symbols.
+    pub fn text_plan(&self) -> text::TextPlan {
+        self.text_plan
+    }
+
+    /// The distinct symbols drawn as glyphs (input order).
+    pub fn glyph_symbols(&self, ctx: &EngineCtx) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (idx, &slot) in self.text_slot.iter().enumerate() {
+            if slot != NO_SLOT {
+                let sym = &ctx.terminal.arena[self.ids[idx].0 as usize].input_symbol;
+                if seen.insert(sym.clone()) {
+                    out.push(sym.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Cells (col, row) that are branding glyph cells, with their text slot.
+    pub fn glyph_cells(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        for (idx, &slot) in self.text_slot.iter().enumerate() {
+            if slot != NO_SLOT {
+                out.push((idx % self.cols, idx / self.cols, slot as usize));
+            }
+        }
+        out
+    }
+
+    /// The glyph state index of a text slot at the last emitted tick.
+    pub fn glyph_state_of(&self, slot: usize) -> usize {
+        let s_max = text::TIERS[self.text_plan.tier].states();
+        self.world.as_ref().map_or(0, |w| w.glyph_state(slot, self.tick.saturating_sub(1), self.dt, s_max))
+    }
+
+    /// Storyboard seconds per tick.
+    pub fn dt(&self) -> f64 {
+        self.dt
+    }
+
     /// The last frame's state drawn with one scene's layer only (no mix):
     /// the endpoints a cross-fade must match.
     pub fn render_only(&mut self, scene: SceneId) -> &Pixbuf {
@@ -303,13 +448,18 @@ impl Starship {
 }
 
 /// The single place the effect hands a cell appearance to the engine. Every
-/// colour is a palette entry, so P×P bounds what the visual pool can hold.
-pub fn emit_appearance(ctx: &mut EngineCtx, id: CharId, fg: PalIdx, bg: PalIdx) {
+/// colour is a palette entry, so P×P bounds the `▀` appearances; `Input`
+/// glyphs only ever get the tier's pairs (`text::reachable_pairs`).
+pub fn emit_appearance(ctx: &mut EngineCtx, id: CharId, glyph: Glyph, fg: PalIdx, bg: PalIdx) {
     let pal = palette();
     let colors = ColorPair::new(Some(pal.colors[fg.0 as usize]), Some(pal.colors[bg.0 as usize]));
     let ch = &mut ctx.terminal.arena[id.0 as usize];
     let uses_pre = ch.uses_input_preexisting_colors;
-    ch.animation.set_appearance(&ch.input_symbol, uses_pre, Some(HALF_BLOCK), Some(colors));
+    let symbol = match glyph {
+        Glyph::HalfBlock => Some(HALF_BLOCK),
+        Glyph::Input => None,
+    };
+    ch.animation.set_appearance(&ch.input_symbol, uses_pre, symbol, Some(colors));
 }
 
 impl EffectHooks for Starship {
@@ -370,7 +520,9 @@ impl Effect for Starship {
         let start = ((self.config.start_at.max(0.0) * fps * scale).round() as u64).min(self.total_ticks - 1);
 
         self.stress = self.config.stress || std::env::var(STRESS_ENV).is_ok_and(|v| v == "1");
-        self.world = Some(World::new(&mut ctx.rng, self.stress, self.cur.aspect()));
+        let mut world = World::new(&mut ctx.rng, self.stress, self.cur.aspect());
+        self.setup_text(ctx, &mut world);
+        self.world = Some(world);
         self.tick = start;
         self.sim_tick = 0;
         palette();

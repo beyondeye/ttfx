@@ -5,6 +5,8 @@
 //! and the time, so `--start-at` can fast-forward by stepping alone.
 
 pub mod ascent;
+pub mod branding;
+pub mod catch;
 pub mod coast;
 pub mod high_altitude;
 pub mod hot_staging;
@@ -42,9 +44,32 @@ pub enum Slot {
     S9Ice,
     S10Haze,
     S10Ice,
+    S11Exhaust,
+    S11Flame,
+    S11Steam,
+    S11SteamTop,
+    S11SteamBase,
+    BSmoke,
 }
 
-const SLOTS: usize = 16;
+const SLOTS: usize = 22;
+
+/// One branding glyph cell: its centre (u, v), reveal start, dissolve start
+/// and the smoke density it was ranked by (storyboard §3).
+#[derive(Debug, Clone, Copy)]
+pub struct TextSlot {
+    pub u: f64,
+    pub v: f64,
+    pub start: f64,
+    pub dissolve: f64,
+    pub density: f64,
+    /// The cell's plate colour (text.rs), stepped each tick while the
+    /// branding runs; `None` before it.
+    pub plate: Option<super::palette::PalIdx>,
+    /// The plate-source mean the plate settled on (the cell is skipped
+    /// while its mean stays within 2 of it; `-1` when not settled).
+    pub plate_from: super::raster::Rgb,
+}
 
 pub struct World {
     pub pool: Pool,
@@ -54,6 +79,22 @@ pub struct World {
     pub stress: bool,
     /// Screen aspect A (width / height in H): world x = u·A.
     pub aspect: f64,
+    /// Branding glyph cells, in cell order.
+    pub text: Vec<TextSlot>,
+    /// The text's bounding box (u0, u1, v0, v1) plus 2 cells of margin.
+    pub text_box: (f64, f64, f64, f64),
+    /// One cell's size (du, dv).
+    pub cell: (f64, f64),
+    /// Smoke particles per cell at the reveal ranking (cols × rows),
+    /// allocated with the text so the ranking tick allocates nothing big.
+    pub density: Vec<u32>,
+    /// The text tier (text.rs) the plates are stepped in.
+    pub text_tier: usize,
+    /// The still branding scene the plates read (allocated with the text).
+    pub plate_buf: Option<Pixbuf>,
+    /// Its static part (11d without shake or particles), drawn once.
+    pub plate_base: Option<Pixbuf>,
+    pub plate_base_ready: bool,
 }
 
 impl World {
@@ -64,7 +105,59 @@ impl World {
                 *p = rng.uniform(0.0, std::f64::consts::TAU);
             }
         }
-        World { pool: Pool::new(), acc: [0.0; SLOTS], phases, stress, aspect }
+        World {
+            pool: Pool::new(),
+            acc: [0.0; SLOTS],
+            phases,
+            stress,
+            aspect,
+            text: Vec::new(),
+            text_box: branding::DEFAULT_BOX,
+            cell: (0.0, 0.0),
+            density: Vec::new(),
+            text_tier: 0,
+            plate_buf: None,
+            plate_base: None,
+            plate_base_ready: false,
+        }
+    }
+
+    /// Register the branding glyph cells (centres in u, v) and the cell size.
+    pub fn set_text(&mut self, cells: Vec<(f64, f64)>, cell: (f64, f64), tier: usize) {
+        self.cell = cell;
+        self.text_tier = tier;
+        if !cells.is_empty() {
+            let (cols, rows) = ((1.0 / cell.0).round() as usize, (1.0 / cell.1).round() as usize);
+            self.density = vec![0; cols * rows];
+            self.plate_buf = Some(Pixbuf::new(cols, 2 * rows));
+            self.plate_base = Some(Pixbuf::new(cols, 2 * rows));
+        }
+        self.text = cells
+            .into_iter()
+            .map(|(u, v)| TextSlot { u, v, start: branding::REVEAL_START, dissolve: branding::DISSOLVE_LAST, density: 0.0, plate: None, plate_from: [-1.0; 3] })
+            .collect();
+        if !self.text.is_empty() {
+            let (mut u0, mut u1, mut v0, mut v1) = (1.0f64, 0.0f64, 1.0f64, 0.0f64);
+            for s in &self.text {
+                u0 = u0.min(s.u);
+                u1 = u1.max(s.u);
+                v0 = v0.min(s.v);
+                v1 = v1.max(s.v);
+            }
+            let (du, dv) = cell;
+            self.text_box = (
+                (u0 - 2.5 * du).max(0.0),
+                (u1 + 2.5 * du).min(1.0),
+                (v0 - 2.5 * dv).max(0.0),
+                (v1 + 2.5 * dv).min(1.0),
+            );
+        }
+    }
+
+    /// The glyph state index (text.rs) of a text slot at `tick`.
+    pub fn glyph_state(&self, slot: usize, tick: u64, dt: f64, s_max: usize) -> usize {
+        let s = &self.text[slot];
+        super::text::glyph_state(s.start, s.dissolve, tick, dt, s_max)
     }
 
     /// Advance from `t0` to `t1 = t0 + dt` (storyboard seconds).
@@ -93,8 +186,60 @@ impl World {
             SceneId::S6 => coast::step(self, rng, t1, dt),
             SceneId::S9 => over_earth::step(self, rng, t1, dt),
             SceneId::S10 => seco::step(self, rng, t1, dt),
-            _ => {}
+            SceneId::S11 => catch::step(self, rng, t1, dt),
+            SceneId::B => branding::step(self, rng, t1, dt),
         }
+        if t0 < branding::REVEAL_START && branding::REVEAL_START <= t1 {
+            branding::rank(self, rng);
+        }
+        if (branding::REVEAL_START..branding::TEXT_END).contains(&t1) {
+            self.step_plates(t1, dt);
+        }
+    }
+
+    /// Step every glyph cell's plate towards the still branding scene at t
+    /// (text.rs `step_plate`: at most one plate step per tick). A cell in its
+    /// `▀` blend or on its approach path keeps its plate: both are drawn from
+    /// it, so a plate step there would add to the blend's own step.
+    fn step_plates(&mut self, t: f64, dt: f64) {
+        let tier = super::text::TIERS[self.text_tier];
+        let (b, s_max) = (super::text::HANDOFF_STATES, tier.states());
+        let tick = (t / dt).round() as u64;
+        let Some(mut buf) = self.plate_buf.take() else { return };
+        if !self.plate_base_ready {
+            if let Some(mut base) = self.plate_base.take() {
+                branding::draw_plate_base(self, &mut base);
+                self.plate_base = Some(base);
+                self.plate_base_ready = true;
+            }
+        }
+        if let Some(base) = &self.plate_base {
+            buf.copy_from(base);
+        }
+        branding::draw_plate_smoke(self, t, &mut buf);
+        let (cols, rows) = (buf.w, buf.h / 2);
+        for i in 0..self.text.len() {
+            let (u, v) = (self.text[i].u, self.text[i].v);
+            let (c, r) = (((u * cols as f64) as usize).min(cols - 1), ((v * rows as f64) as usize).min(rows - 1));
+            let (top, bottom) = (buf.px[2 * r * cols + c], buf.px[(2 * r + 1) * cols + c]);
+            let mean = [(top[0] + bottom[0]) / 2.0, (top[1] + bottom[1]) / 2.0, (top[2] + bottom[2]) / 2.0];
+            // A settled plate only needs a new look once its source colour has
+            // moved: the drifting billows shift most means a little each tick.
+            let from = self.text[i].plate_from;
+            if self.text[i].plate.is_some() && (0..3).map(|k| (from[k] - mean[k]).abs()).sum::<f32>() <= 2.0 {
+                continue;
+            }
+            let s = self.glyph_state(i, tick, dt, s_max);
+            if self.text[i].plate.is_some() && (1..=b + tier.m).contains(&s) {
+                continue;
+            }
+            let (next, settled) = super::text::step_plate(self.text_tier, self.text[i].plate, mean);
+            // Settled on the target: the same mean gives the same plate, so
+            // the next tick can skip it.
+            self.text[i].plate_from = if settled { mean } else { [-1.0; 3] };
+            self.text[i].plate = Some(next);
+        }
+        self.plate_buf = Some(buf);
     }
 
     /// Draw one scene's layer at time t (no blending).
@@ -112,7 +257,8 @@ impl World {
             SceneId::S6 => coast::draw(self, t, buf),
             SceneId::S9 => over_earth::draw(self, t, buf),
             SceneId::S10 => seco::draw(self, t, buf),
-            _ => draw_placeholder(buf),
+            SceneId::S11 => catch::draw(self, t, buf),
+            SceneId::B => branding::draw(self, t, buf),
         }
     }
 
@@ -155,11 +301,6 @@ impl World {
             self.pool.spawn(rng, spec, u * self.aspect, v, owner.tag(), 1);
         }
     }
-}
-
-pub fn draw_placeholder(buf: &mut Pixbuf) {
-    let p = super::palette::PLACEHOLDER;
-    buf.fill([p[0] as f32, p[1] as f32, p[2] as f32]);
 }
 
 /// Stress layer: keep the pool full of short-lived random particles.

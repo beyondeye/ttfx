@@ -5,10 +5,11 @@
 use clap::Parser;
 
 use ttfx::cli::Cli;
-use ttfx::effects::starship::palette::{self, palette, Ramp, ALL_RAMPS, P_CAP, PLACEHOLDER};
+use ttfx::effects::starship::palette::{self, palette, Ramp, ALL_RAMPS, P_CAP};
 use ttfx::effects::starship::particles::POOL_CAPACITY;
 use ttfx::effects::starship::raster::Pixbuf;
-use ttfx::effects::starship::scenes::{hot_staging, over_earth, seco, space};
+use ttfx::effects::starship::scenes::{branding, catch, hot_staging, over_earth, seco, space};
+use ttfx::effects::starship::text::{self, CellDraw, TIERS};
 use ttfx::effects::starship::timeline::{self, blend_weight, scene_at, Blend, SceneId, TOTAL_SECONDS};
 use ttfx::effects::starship::{Starship, StarshipConfig, HALF_BLOCK};
 use ttfx::engine::canvas::Anchor;
@@ -25,10 +26,16 @@ const GRID_4K: (i64, i64) = (274, 67);
 
 // ---- harness ----------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq)]
+struct Cell {
+    symbol: String,
+    fg: [u8; 3],
+    bg: [u8; 3],
+}
+
 struct Run {
     ctx: EngineCtx,
     fx: Starship,
-    fps: i64,
 }
 
 fn config(start_at: f64, duration_scale: f64, stress: bool) -> StarshipConfig {
@@ -36,6 +43,10 @@ fn config(start_at: f64, duration_scale: f64, stress: bool) -> StarshipConfig {
 }
 
 fn run_with(grid: (i64, i64), fps: i64, seed: u64, cfg: StarshipConfig) -> Run {
+    run_input(grid, fps, seed, cfg, INPUT)
+}
+
+fn run_input(grid: (i64, i64), fps: i64, seed: u64, cfg: StarshipConfig, input: &str) -> Run {
     let tc = TerminalConfig {
         frame_rate: fps,
         canvas_width: grid.0,
@@ -46,10 +57,10 @@ fn run_with(grid: (i64, i64), fps: i64, seed: u64, cfg: StarshipConfig) -> Run {
         anchor_text: Anchor::C,
         ..TerminalConfig::default()
     };
-    let mut ctx = EngineCtx::new(INPUT, tc, Rng::seeded(seed), Clock::virtual_with_frame_rate(fps)).expect("ctx");
+    let mut ctx = EngineCtx::new(input, tc, Rng::seeded(seed), Clock::virtual_with_frame_rate(fps)).expect("ctx");
     let mut fx = Starship::new(cfg);
     fx.build(&mut ctx).expect("build");
-    Run { ctx, fx, fps }
+    Run { ctx, fx }
 }
 
 fn run(grid: (i64, i64), fps: i64, seed: u64) -> Run {
@@ -63,7 +74,8 @@ impl Run {
 
     /// Play until the frame at storyboard time `t` has been emitted.
     fn play_to(&mut self, t: f64) {
-        let target = (t * self.fps as f64).round() as u64;
+        // Storyboard time: a tick is `dt` = 1 / (fps · duration scale).
+        let target = (t / self.fx.dt()).round() as u64;
         while self.ticks_done() <= target {
             self.frame().expect("frame before the end");
         }
@@ -73,26 +85,86 @@ impl Run {
         self.fx.ticks().1
     }
 
-    /// The emitted half-block pixels of the last frame, read from the engine's
-    /// own cell visuals (what `ctx.frame()` formats).
-    fn engine_pixels(&self) -> Vec<[u8; 3]> {
+    /// What the engine shows per cell (row-major): symbol, fg, bg, read from
+    /// its own cell visuals (what `ctx.frame()` formats).
+    fn engine_cells(&self) -> Vec<Cell> {
         let (cols, rows) = self.fx.grid();
         let canvas = &self.ctx.terminal.canvas;
-        let mut out = vec![[0u8; 3]; cols * rows * 2];
+        let mut out = vec![Cell { symbol: String::new(), fg: [0; 3], bg: [0; 3] }; cols * rows];
         let all = CharacterFilter { input_chars: true, inner_fill_chars: true, outer_fill_chars: true, added_chars: false };
         for id in self.ctx.terminal.collect_characters(all) {
             let ch = &self.ctx.terminal.arena[id.0 as usize];
             let c = ch.motion.current_coord;
             let (col, row) = ((c.column - canvas.left) as usize, (canvas.top - c.row) as usize);
+            if col >= cols || row >= rows {
+                continue;
+            }
             let v = ch.animation.current_character_visual;
-            assert_eq!(v.symbol, HALF_BLOCK);
             let colors = v.colors.expect("colours");
             let rgb = |c: Option<ttfx::utils::graphics::Color>| {
                 let (r, g, b) = c.expect("set").rgb_ints();
                 [r, g, b]
             };
-            out[2 * row * cols + col] = rgb(colors.fg_color);
-            out[(2 * row + 1) * cols + col] = rgb(colors.bg_color);
+            out[row * cols + col] = Cell { symbol: v.symbol.to_string(), fg: rgb(colors.fg_color), bg: rgb(colors.bg_color) };
+        }
+        out
+    }
+
+    /// The emitted half-block pixels of the last frame (2 per cell). A glyph
+    /// cell counts as its bg in both halves: the scene-metric view.
+    fn engine_pixels(&self) -> Vec<[u8; 3]> {
+        let cols = self.fx.grid().0;
+        let cells = self.engine_cells();
+        let rows = cells.len() / cols.max(1);
+        let mut out = vec![[0u8; 3]; cols * rows * 2];
+        for (i, c) in cells.iter().enumerate() {
+            let (col, row) = (i % cols, i / cols);
+            let top = if c.symbol == HALF_BLOCK { c.fg } else { c.bg };
+            out[2 * row * cols + col] = top;
+            out[(2 * row + 1) * cols + col] = c.bg;
+        }
+        out
+    }
+
+    /// Per cell (row-major): the input character's own symbol, or `None` for
+    /// fill cells.
+    fn input_cells(&self) -> Vec<Option<String>> {
+        let (cols, rows) = self.fx.grid();
+        let canvas = &self.ctx.terminal.canvas;
+        let mut out = vec![None; cols * rows];
+        let input = CharacterFilter { input_chars: true, inner_fill_chars: false, outer_fill_chars: false, added_chars: false };
+        for id in self.ctx.terminal.collect_characters(input) {
+            let ch = &self.ctx.terminal.arena[id.0 as usize];
+            let c = ch.motion.current_coord;
+            let (col, row) = ((c.column - canvas.left) as usize, (canvas.top - c.row) as usize);
+            if col < cols && row < rows {
+                out[row * cols + col] = Some(ch.input_symbol.clone());
+            }
+        }
+        out
+    }
+
+    /// Glyph-aware pixels: `▀`/`▄`/`█` exactly, any other glyph as bg plus a
+    /// quarter of its ink in each half.
+    fn cell_pixels(&self) -> Vec<[u8; 3]> {
+        let cols = self.fx.grid().0;
+        let cells = self.engine_cells();
+        let rows = cells.len() / cols.max(1);
+        let mut out = vec![[0u8; 3]; cols * rows * 2];
+        for (i, c) in cells.iter().enumerate() {
+            let (col, row) = (i % cols, i / cols);
+            let ink = |k: f64| -> [u8; 3] {
+                let m = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * k).round() as u8;
+                [m(c.bg[0], c.fg[0]), m(c.bg[1], c.fg[1]), m(c.bg[2], c.fg[2])]
+            };
+            let (top, bottom) = match c.symbol.as_str() {
+                "▀" => (c.fg, c.bg),
+                "▄" => (c.bg, c.fg),
+                "█" => (c.fg, c.fg),
+                _ => (ink(0.25), ink(0.25)),
+            };
+            out[2 * row * cols + col] = top;
+            out[(2 * row + 1) * cols + col] = bottom;
         }
         out
     }
@@ -167,7 +239,6 @@ fn pixbuf_rgb(buf: &Pixbuf) -> Vec<[u8; 3]> {
 fn palette_cap_and_constancy() {
     let p = palette();
     assert!(p.len() <= P_CAP, "palette {} > cap {P_CAP}", p.len());
-    assert!(p.index_of(PLACEHOLDER).is_some(), "placeholder colour is a palette entry");
     let fresh = palette::Palette::build_uncached();
     assert_eq!(fresh.checksum(), p.checksum(), "the palette is a pure constant");
     assert_eq!(fresh.len(), p.len());
@@ -185,6 +256,7 @@ fn emitted_colours_in_palette_and_appearance_bound() {
     use std::collections::HashSet;
     let pal = palette();
     let mut seen: HashSet<([u8; 3], [u8; 3])> = HashSet::new();
+    let mut glyphs: HashSet<(String, [u8; 3], [u8; 3])> = HashSet::new();
     let mut counts = Vec::new();
     for (seed, stress) in [(1, false), (2, false), (3, false), (4, true)] {
         let mut r = run_with(GRID_1080, 60, seed, config(0.0, 1.0, stress));
@@ -192,6 +264,12 @@ fn emitted_colours_in_palette_and_appearance_bound() {
         while r.frame().is_some() {
             // Every 4th tick keeps the run fast; colours are checked each time.
             if k.is_multiple_of(4) {
+                for c in r.engine_cells() {
+                    if c.symbol != HALF_BLOCK {
+                        assert!(pal.index_of(c.fg).is_some() && pal.index_of(c.bg).is_some());
+                        glyphs.insert((c.symbol, c.fg, c.bg));
+                    }
+                }
                 let px = r.engine_pixels();
                 for pair in px.chunks(r.fx.grid().0 * 2).flat_map(|rows| {
                     let cols = rows.len() / 2;
@@ -209,8 +287,12 @@ fn emitted_colours_in_palette_and_appearance_bound() {
         counts.push(seen.len());
     }
     let bound = pal.len() * pal.len();
-    eprintln!("appearance counts after each run: {counts:?} (bound |P|² = {bound})");
+    // The fixture: 13 glyph symbols plus the space fill.
+    let text_bound = text::text_appearance_bound(14, 13);
+    eprintln!("appearance counts after each run: {counts:?} (bound |P|² = {bound}); glyph appearances {} (bound {text_bound})", glyphs.len());
     assert!(seen.len() <= bound);
+    assert!(!glyphs.is_empty(), "the branding drew glyph cells");
+    assert!(glyphs.len() <= text_bound, "{} glyph appearances over the bound {text_bound}", glyphs.len());
 }
 
 #[test]
@@ -273,6 +355,11 @@ fn palette_error_synthetic() {
         (0xd5e5e9, 0x010205),
         (0x565b67, 0x010205),
         (0xe2ecee, 0x191421),
+        // Scene 11: steam over the overcast and the flats, flame over steel.
+        (0xc4bcb0, 0x9f9c94),
+        (0xc4bcb0, 0xaaa197),
+        (0xf3d592, 0x9a8d7c),
+        (0xc7c0b4, 0x56544a),
     ]);
     for &(o, s) in &pairs {
         for i in 0..=12 {
@@ -531,6 +618,34 @@ const SIGS: &[Sig] = &[
         near_black: (15.0, 55.0),
         bright: (3.0, 100.0),
     },
+    Sig {
+        name: "11a",
+        t: 46.0,
+        near: &[(0xb2a99e, 50.0, 12.0), (0x6a6054, 33.0, 12.0), (0x524c3e, 22.0, 12.0)],
+        near_black: (0.0, 5.0),
+        bright: (8.0, 100.0),
+    },
+    Sig {
+        name: "11b",
+        t: 49.3,
+        near: &[(0x9f9c94, 66.0, 15.0), (0xada79e, 58.0, 12.0), (0x2d2c22, 16.0, 10.0)],
+        near_black: (0.0, 5.0),
+        bright: (0.0, 100.0),
+    },
+    Sig {
+        name: "11c",
+        t: 52.7,
+        near: &[(0x9a8d7c, 51.0, 12.0), (0xc7bbab, 27.0, 12.0), (0x2f2e2b, 12.0, 10.0)],
+        near_black: (0.0, 5.0),
+        bright: (3.0, 100.0),
+    },
+    Sig {
+        name: "11d",
+        t: 56.0,
+        near: &[(0xa3a39b, 52.0, 12.0), (0x56544a, 26.0, 12.0), (0x37352b, 25.0, 12.0)],
+        near_black: (0.0, 5.0),
+        bright: (3.0, 100.0),
+    },
 ];
 
 /// Measure one signature on a run already positioned at its time.
@@ -576,12 +691,12 @@ fn signatures_at(grid: (i64, i64), names: &[&str]) {
 
 #[test]
 fn signatures_1080() {
-    signatures_at(GRID_1080, &["1a", "1b", "2a", "2b", "3", "4", "5", "6", "9", "10a", "10b"]);
+    signatures_at(GRID_1080, &["1a", "1b", "2a", "2b", "3", "4", "5", "6", "9", "10a", "10b", "11a", "11b", "11c", "11d"]);
 }
 
 #[test]
 fn signatures_4k() {
-    signatures_at(GRID_4K, &["1a", "3", "5", "9", "10b"]);
+    signatures_at(GRID_4K, &["1a", "3", "5", "9", "10b", "11b", "11d"]);
 }
 
 /// Dev aid (not run by default): write the emitted pixels at the given times
@@ -596,7 +711,7 @@ fn dump_frames() {
     let mut r = run(grid, 60, 1);
     for t in times {
         r.play_to(t);
-        let bytes: Vec<u8> = r.engine_pixels().into_iter().flatten().collect();
+        let bytes: Vec<u8> = r.cell_pixels().into_iter().flatten().collect();
         std::fs::write(format!("{dir}/t{t:05.2}_{}x{}.rgb", grid.0, grid.1), bytes).unwrap();
     }
 }
@@ -643,31 +758,26 @@ const STEP_LIMIT: f64 = 12.0;
 /// A hard cut must move the frame by more than this (measured: 81–256).
 const CUT_LIMIT: f64 = 25.0;
 
-/// Scenes still drawn as the flat placeholder; t1_4/t1_5 shrink this list.
-const PLACEHOLDER_SCENES: &[SceneId] = &[SceneId::S11, SceneId::B];
-
+/// No scene is a placeholder any more: the dispatch matches every `SceneId`
+/// (a compile-time property), and no emitted pixel is the old magenta.
 #[test]
-fn placeholders_listed_honestly() {
+fn no_placeholder_anywhere() {
     let mut r = run(GRID_1080, 60, 1);
-    let cols = r.fx.grid().0;
-    for spec in timeline::SCENES {
-        // Mid-scene, but before the loop fade for B.
-        let t = (spec.start + spec.dur / 2.0).min(timeline::LOOP_FADE_START - 1.0);
-        r.play_to(t);
-        let reg = region(&r.engine_pixels(), cols);
-        let ph = 100.0 * frac(&reg, |p| p == PLACEHOLDER);
-        if PLACEHOLDER_SCENES.contains(&spec.id) {
-            assert!(ph >= 99.0, "{:?} is listed as a placeholder but only {ph:.1}% is: shrink PLACEHOLDER_SCENES", spec.id);
-        } else {
-            assert_eq!(ph, 0.0, "{:?} is implemented but shows {ph:.1}% placeholder", spec.id);
+    let mut k = 0u64;
+    while r.frame().is_some() {
+        if k.is_multiple_of(2) {
+            let px = r.engine_pixels();
+            let ph = px.iter().filter(|&&p| dist(p, hexrgb(0xff00ff)) <= 48.0).count();
+            assert_eq!(ph, 0, "{ph} placeholder-magenta pixels at {:.3}s", r.fx.time());
         }
+        k += 1;
     }
 }
 
 #[test]
 fn cuts_are_cuts() {
     let mut r = run(GRID_1080, 60, 1);
-    for b in [6.0, 16.0, 22.0, 25.0, 35.0, 39.0, 45.0] {
+    for b in [6.0, 16.0, 22.0, 25.0, 35.0, 39.0, 45.0, 47.0, 51.5, 54.0] {
         r.play_to(b - 1.0 / 60.0);
         let before = r.engine_pixels();
         r.frame().unwrap();
@@ -746,6 +856,9 @@ fn hard_cuts_clear_the_pool() {
         (35.0, SceneId::S6),
         (39.0, SceneId::S9),
         (45.0, SceneId::S10),
+        (47.0, SceneId::S11),
+        (51.5, SceneId::S11),
+        (54.0, SceneId::S11),
     ] {
         r.play_to(b - dt);
         assert!(r.fx.live_particles() > 0, "particles alive before the cut at {b}");
@@ -822,6 +935,11 @@ fn implemented_shots_move() {
         (36.0, 36.5),
         (40.0, 40.5),
         (43.0, 43.5),
+        (45.5, 46.0),
+        (48.0, 48.5),
+        (52.0, 52.5),
+        (55.0, 55.5),
+        (60.0, 60.5),
     ] {
         r.play_to(a);
         let pa = r.engine_pixels();
@@ -849,7 +967,22 @@ fn loop_rebuild_is_seamless() {
         a.frame().unwrap();
         let first = a.engine_pixels();
         let mut last = first.clone();
+        let mut prev_cells: Option<Vec<[u8; 3]>> = None;
         while a.frame().is_some() {
+            let t = a.fx.time();
+            if t >= 63.5 {
+                // The last 0.5 s, tick by tick, like a fade, glyph-aware.
+                let cp = a.cell_pixels();
+                if let Some(p) = &prev_cells {
+                    let (d, _) = frame_distance(p, &cp);
+                    assert!(d < STEP_LIMIT, "loop fade step {d:.2} at {t:.3}s ({fps} fps)");
+                }
+                prev_cells = Some(cp);
+            }
+            if t >= 63.7 {
+                let glyphs = a.engine_cells().iter().filter(|c| c.symbol != HALF_BLOCK).count();
+                assert_eq!(glyphs, 0, "glyph cells left at {t:.3}s ({fps} fps)");
+            }
             last = a.engine_pixels();
         }
         // The screensaver rebuilds with the same seed after None.
@@ -887,17 +1020,21 @@ fn palette_error_real_frames() {
 #[test]
 fn particle_budget_holds() {
     let mut r = run(GRID_1080, 60, 1);
-    let (mut max_all, mut max5, mut max10) = (0usize, 0usize, 0usize);
+    let (mut max_all, mut max5, mut max10, mut max11, mut max_b) = (0usize, 0usize, 0usize, 0usize, 0usize);
     while r.frame().is_some() {
         let n = r.fx.live_particles();
         max_all = max_all.max(n);
         match scene_at(r.fx.time()) {
             SceneId::S5 => max5 = max5.max(n),
             SceneId::S10 => max10 = max10.max(n),
+            SceneId::S11 => max11 = max11.max(n),
+            SceneId::B => max_b = max_b.max(n),
             _ => {}
         }
     }
-    eprintln!("live particles: max {max_all}, scene 5 {max5}, scene 10 {max10}");
+    eprintln!("live particles: max {max_all}, scene 5 {max5}, scene 10 {max10}, scene 11 {max11}, B {max_b}");
+    assert!((1000..=3500).contains(&max11), "scene 11 peak {max11}");
+    assert!((2000..=4500).contains(&max_b), "B peak {max_b}");
     assert!(max_all < POOL_CAPACITY, "the pool filled up ({max_all}): spawns were dropped");
     assert!((1500..=4000).contains(&max5), "scene 5 peak {max5}");
     assert!((1500..=4000).contains(&max10), "scene 10 peak {max10}");
@@ -1056,7 +1193,10 @@ fn seco_stars_and_bloom() {
 fn events_step_smoothly() {
     let fps = 120;
     let mut r = run(GRID_1080, fps, 1);
-    for (a, b) in [(25.95, 26.6), (27.4, 29.8), (39.05, 40.0)] {
+    // (start, end, changed-fraction floor): the settling tower is a textured
+    // lattice moving at sub-pixel speed, so a 1-px shift changes most of its
+    // pixels at once; its floor is larger.
+    for (a, b, floor) in [(25.95, 26.6, 0.02), (27.4, 29.8, 0.02), (39.05, 40.0, 0.02), (49.0, 50.4, 0.05), (50.3, 51.3, 0.05), (58.0, 59.5, 0.02)] {
         r.play_to(a - 1.0 / fps as f64);
         let mut prev = r.engine_pixels();
         let mut steps = Vec::new();
@@ -1079,9 +1219,9 @@ fn events_step_smoothly() {
         eprintln!("{a}–{b}: worst step {worst_d:.2} ({}), changed median {:.3} max {:.3}", top.join(", "), median, worst_c);
         for &(t, d, c) in &steps {
             assert!(d < STEP_LIMIT, "t {t:.3}: step {d:.2} ≥ {STEP_LIMIT}");
-            // A floor of 2 % keeps a near-static window (median ≈ 0) from
+            // A floor (2 %) keeps a near-static window (median ≈ 0) from
             // flagging ordinary particle motion as a spike.
-            assert!(c <= 3.0 * median + 0.02, "t {t:.3}: {:.1}% of pixels changed (median {:.1}%)", 100.0 * c, 100.0 * median);
+            assert!(c <= 3.0 * median + floor, "t {t:.3}: {:.1}% of pixels changed (median {:.1}%)", 100.0 * c, 100.0 * median);
         }
     }
 }
@@ -1160,4 +1300,485 @@ fn seco_limb_arc_holds_on_any_aspect() {
         }
     }
     assert_eq!(stray, 0, "{stray} limb-coloured pixels below the thin top arc on the ultrawide grid");
+}
+
+// ---- the catch (storyboard §2.9) --------------------------------------------
+
+#[test]
+fn catch_geometry() {
+    // The tower settles: down to its overshoot minimum, back up, at rest.
+    let samples: Vec<(f64, f64)> = (0..=4500).map(|i| 47.0 + i as f64 * 0.001).map(|t| (t, catch::tower_top_11b(t))).collect();
+    let (t_min, v_min) = samples.iter().copied().fold((0.0, f64::MAX), |acc, x| if x.1 < acc.1 { x } else { acc });
+    assert!(v_min < 0.30 && v_min > 0.28, "overshoot minimum {v_min:.4} at {t_min:.3}");
+    for w in samples.windows(2) {
+        let ((t0, v0), (_, v1)) = (w[0], w[1]);
+        if t0 < t_min {
+            assert!(v1 <= v0 + 1e-12, "tower top rises before its minimum at {t0:.3}");
+        } else {
+            assert!(v1 >= v0 - 1e-12, "tower top falls after its minimum at {t0:.3}");
+        }
+    }
+    for &(t, v) in samples.iter().filter(|s| s.0 >= 50.33) {
+        assert!((v - 0.30).abs() <= 0.002, "tower top {v:.4} at {t:.3}, not at rest");
+    }
+    // 2 ms: below x = 1e-4 the engine's bezier uses a linear approximation.
+    let h = 2e-3;
+    let before = (catch::tower_top_11b(49.0) - catch::tower_top_11b(49.0 - h)) / h;
+    let after = (catch::tower_top_11b(49.0 + h) - catch::tower_top_11b(49.0)) / h;
+    assert!((before - after).abs() / before.abs() < 0.03, "speed jumps at 49.0: {before:.4} → {after:.4}");
+    // The arms: open at 35° until 50.3, closing monotonically to 5° at 51.3.
+    assert!((catch::arm_angle(50.0).to_degrees() - 35.0).abs() < 1e-9);
+    assert!((catch::arm_angle(51.3).to_degrees() - 5.0).abs() < 1e-9);
+    let mut prev = catch::arm_angle(50.3);
+    for i in 1..=100 {
+        let a = catch::arm_angle(50.3 + i as f64 * 0.01);
+        assert!(a <= prev + 1e-12, "the arms open again at {:.2}", 50.3 + i as f64 * 0.01);
+        prev = a;
+    }
+    // On every aspect the closed tips touch the hull (within a pixel at the
+    // coarsest 33-row grid) and never cross the ship's axis.
+    let px_h = 1.0 / (2.0 * 33.0 * 8.0 / 7.0);
+    for a in ASPECTS {
+        let (x0, x1, _, _) = catch::ship_11b(a);
+        for (_, tip) in catch::arms(51.3, a) {
+            assert!((tip.0 - x1).abs() <= px_h, "aspect {a:.3}: tip at {:.4}, hull side at {x1:.4}", tip.0);
+        }
+        for i in 0..=450 {
+            let t = 47.0 + i as f64 * 0.01;
+            for (_, tip) in catch::arms(t, a) {
+                assert!(tip.0 > (x0 + x1) / 2.0, "aspect {a:.3}: an arm crosses the ship's axis at {t:.2}");
+            }
+        }
+    }
+}
+
+#[test]
+fn continuous_11d_b_keeps_the_world() {
+    let dt = 1.0 / 60.0;
+    let mut r = run(GRID_1080, 60, 1);
+    r.play_to(58.0 - dt);
+    let before = r.engine_pixels();
+    let old = survivors(&r, SceneId::S11, dt);
+    r.frame().unwrap();
+    assert!((r.fx.time() - 58.0).abs() < 1e-9);
+    let kept = survivors(&r, SceneId::S11, dt);
+    assert!(old > 0 && kept > old / 2, "11d's steam must survive 58.0 (before {old}, after {kept})");
+    let (d, _) = frame_distance(&before, &r.engine_pixels());
+    assert!(d < STEP_LIMIT, "step across 58.0: {d:.2}");
+}
+
+// ---- the branding (storyboard §3) and its bounded glyph cells ---------------
+
+#[test]
+fn text_budget_and_tiers() {
+    for nd in 0..=20_000usize {
+        for n in [nd.saturating_sub(1), nd] {
+            let b = text::text_appearance_bound(nd, n);
+            assert!(b + nd <= text::SYMBOL_BUDGET.max(nd), "n_d {nd}, n {n}: {b} glyph appearances");
+        }
+    }
+    for (n, tier) in [(17, 0), (18, 1), (35, 1), (36, 2), (70, 2), (71, 3), (157, 3), (158, 4), (487, 4), (488, 5), (2047, 5), (2048, 6), (5119, 6)] {
+        let p = text::plan_for(n + 1, n);
+        assert_eq!((p.tier, p.k_symbols), (tier, n), "n = {n}");
+    }
+    let p = text::plan_for(5121, 5120);
+    assert_eq!((p.tier, p.k_symbols), (6, text::SYMBOL_BUDGET - 5121), "overflow keeps the k most frequent");
+    assert_eq!(text::plan_for(18_358, 18_357).k_symbols, 0, "n_d ≥ budget: no glyphs");
+    let counts: Vec<(String, usize)> = [("a", 3), ("b", 1), ("c", 3), ("d", 2)].iter().map(|&(s, c)| (s.to_string(), c)).collect();
+    assert_eq!(text::glyph_symbols(&counts, 2), ["a", "c"]);
+    assert_eq!(text::glyph_symbols(&counts, 3), ["a", "c", "d"]);
+    assert_eq!(text::glyph_symbols(&counts, 9).len(), 4);
+    let ties: Vec<(String, usize)> = ["x", "y", "z"].iter().map(|s| (s.to_string(), 1)).collect();
+    assert_eq!(text::glyph_symbols(&ties, 2), ["x", "y"], "ties go by first occurrence");
+}
+
+/// The reveal and dissolve state index, at the screensaver's and the CLI's
+/// frame rates and at accelerated playback (`--duration-scale 0.25`):
+/// - the plain scene on the first and last active tick, and 0 outside;
+/// - hold from `start + FADE_SECONDS` (+ one tick), every dissolve done by
+///   63.7, so the storyboard timing holds at any scale;
+/// - a glyph never appears or vanishes except next to the flat state B;
+/// - at scale 1 (60 and 120 fps) at most one state per tick.
+#[test]
+fn glyph_state_index_is_tick_aligned() {
+    let mut rng = Rng::seeded(7);
+    let b = text::HANDOFF_STATES;
+    for (fps, scale) in [(60.0, 1.0), (120.0, 1.0), (60.0, 0.25), (120.0, 0.25), (60.0, 4.0)] {
+        let dt = 1.0 / (fps * scale);
+        let s_max = TIERS[0].states();
+        let mut starts: Vec<f64> = (0..2000).map(|_| rng.uniform(58.0, branding::REVEAL_START + branding::REVEAL_SPAN)).collect();
+        starts.extend([58.91875, 58.0, branding::REVEAL_START + branding::REVEAL_SPAN]);
+        for start in starts {
+            let dissolve = branding::DISSOLVE_LAST - (start - branding::REVEAL_START) * branding::DISSOLVE_SPAN / branding::REVEAL_SPAN;
+            let end = dissolve + text::FADE_SECONDS;
+            assert!(end <= 63.7 + 1e-9, "dissolve of {start} ends at {end}");
+            let state = |i: u64| text::glyph_state(start, dissolve, i, dt, s_max);
+            let i_from = ((start - 0.2) / dt) as u64;
+            let i_to = ((end + 0.2) / dt) as u64;
+            let mut prev = state(i_from);
+            assert_eq!(prev, 0);
+            let mut first_on: Option<u64> = None;
+            let mut last_on: Option<u64> = None;
+            for i in i_from + 1..=i_to {
+                let s = state(i);
+                let t = i as f64 * dt;
+                let ctx = format!("start {start} at {fps} fps ×{scale}: {prev} → {s} at {t:.4}");
+                if scale == 1.0 {
+                    assert!(s.abs_diff(prev) <= 1, "{ctx}");
+                }
+                assert!(!((prev < b && s > b) || (prev > b && s < b)), "a glyph switch skips the flat state: {ctx}");
+                if t + 1e-9 >= start && first_on.is_none() {
+                    first_on = Some(i);
+                    assert_eq!(s, 0, "the first active tick is not the plain scene: {ctx}");
+                }
+                if t >= start + text::FADE_SECONDS + dt + 1e-9 && t < dissolve - 1e-9 {
+                    assert_eq!(s, s_max, "not in hold: {ctx}");
+                }
+                if t < end - 1e-9 {
+                    last_on = Some(i);
+                } else {
+                    assert_eq!(s, 0, "glyph left after its dissolve: {ctx}");
+                }
+                prev = s;
+            }
+            assert_eq!(state(last_on.expect("dissolves")), 0, "start {start}: the last active tick is not the plain scene");
+            if scale == 1.0 {
+                let held = (0..).map(|k| i_from + k).find(|&i| state(i) == s_max).unwrap() as f64 * dt;
+                assert!(held <= 59.5 + 1e-9, "start {start}: hold at {held:.4}");
+            }
+        }
+    }
+}
+
+#[test]
+fn glyph_cell_states() {
+    let pal = palette();
+    let f = text::text_ramp();
+    assert_eq!(f.len(), 8);
+    assert_eq!(pal.rgb_of(*f.last().unwrap()), hexrgb(0xf3efe6));
+    let scenes = [([200.0f32, 190.0, 170.0], [40.0f32, 60.0, 90.0]), ([30.0, 61.0, 78.0], [64.0, 110.0, 136.0]), ([120.0, 118.0, 110.0], [86.0, 84.0, 74.0])];
+    for (tier, &t) in TIERS.iter().enumerate() {
+        let s_max = t.states();
+        let pairs: std::collections::HashSet<(u16, u16)> = text::reachable_pairs(tier).iter().map(|p| (p.0 .0, p.1 .0)).collect();
+        assert!(pairs.len() <= t.cost(), "T{tier}: {} pairs > cost {}", pairs.len(), t.cost());
+        let g = &text::plate()[..t.g];
+        assert!(g.iter().any(|&i| text::luma(pal.rgb_of(i)) <= 0.50), "T{tier}: no capped plate entry");
+        for &gi in g {
+            for (top, bottom) in scenes {
+                assert_eq!(text::cell_state(tier, 0, top, bottom, gi), CellDraw::HalfBlock(pal.nearest(top), pal.nearest(bottom)));
+                assert_eq!(text::cell_state(tier, text::HANDOFF_STATES, top, bottom, gi), CellDraw::HalfBlock(gi, gi));
+                let mut prev_fg = pal.rgb_of(gi);
+                for s in text::HANDOFF_STATES + 1..=s_max {
+                    let CellDraw::Glyph(fg, bg) = text::cell_state(tier, s, top, bottom, gi) else { panic!("T{tier} s {s}: not a glyph") };
+                    assert_eq!(bg, gi, "T{tier} s {s}: the glyph's bg is the plate");
+                    assert!(pairs.contains(&(fg.0, bg.0)), "T{tier} s {s}: pair outside the tier's set");
+                    if tier <= 2 {
+                        let step = dist(prev_fg, pal.rgb_of(fg));
+                        assert!(step <= 48.0, "T{tier} plate {:?} s {s}: fg step {step:.1}", pal.rgb_of(gi));
+                    }
+                    prev_fg = pal.rgb_of(fg);
+                }
+                assert_eq!(text::cell_state(tier, s_max, top, bottom, gi), CellDraw::Glyph(*f.last().unwrap(), gi), "T{tier}: hold is #f3efe6");
+            }
+        }
+    }
+}
+
+/// The plate stands in for the scene behind the text: its quantisation
+/// error on real composited text-box colours.
+#[test]
+fn plate_quantisation_error() {
+    let mut r = run(GRID_1080, 60, 1);
+    let pal = palette();
+    let mut errs = Vec::new();
+    for t in [59.5, 61.0, 62.5, 63.0] {
+        r.play_to(t);
+        let buf = r.fx.unquantised();
+        for (col, row, slot) in r.fx.glyph_cells() {
+            let (top, bottom) = (buf.px[2 * row * buf.w + col], buf.px[(2 * row + 1) * buf.w + col]);
+            let c = [0, 1, 2].map(|k| (top[k] + bottom[k]) / 2.0);
+            let _ = slot;
+            let l = text::luma([c[0] as u8, c[1] as u8, c[2] as u8]);
+            let k = if l > text::CAP_LUMA { (text::CAP_LUMA / l) as f32 } else { 1.0 };
+            let c = c.map(|v| v * k);
+            let g = text::nearest_plate(0, c, true);
+            errs.push(dist([c[0] as u8, c[1] as u8, c[2] as u8], pal.rgb_of(g)));
+        }
+        let at: Vec<f64> = errs.iter().rev().take(r.fx.glyph_cells().len()).copied().collect();
+        eprintln!("plate error at {t}: mean {:.2} max {:.2}", at.iter().sum::<f64>() / at.len() as f64, at.iter().fold(0.0f64, |m, &x| m.max(x)));
+    }
+    errs.sort_by(|a, b| a.total_cmp(b));
+    let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+    let p99 = errs[(errs.len() - 1) * 99 / 100];
+    eprintln!("plate error: n={} mean={mean:.2} p99={p99:.2}", errs.len());
+    assert!(mean <= 10.0 && p99 <= 28.0, "plate error mean {mean:.2} p99 {p99:.2}");
+}
+
+/// Share of the non-space input characters shown with their own symbol and a
+/// luma contrast ≥ 0.35.
+fn visible_share(r: &Run) -> (f64, usize) {
+    let cells = r.engine_cells();
+    let inputs = r.input_cells();
+    let (mut total, mut shown) = (0usize, 0usize);
+    for (c, i) in cells.iter().zip(&inputs) {
+        if let Some(sym) = i {
+            total += 1;
+            if &c.symbol == sym && luma(c.fg) - luma(c.bg) >= 0.35 {
+                shown += 1;
+            }
+        }
+    }
+    (shown as f64 / total.max(1) as f64, total)
+}
+
+#[test]
+fn branding_reveal() {
+    for fps in [60i64, 120] {
+        let dt = 1.0 / fps as f64;
+        let mut r = run(GRID_1080, fps, 1);
+        r.play_to(58.0 - dt);
+        assert!(r.engine_cells().iter().all(|c| c.symbol == HALF_BLOCK), "glyphs before 58.0");
+        r.frame().unwrap();
+        let world = r.fx.world().expect("world");
+        let mut slots: Vec<_> = world.text.clone();
+        assert!(!slots.is_empty());
+        for s in &slots {
+            assert!(s.start >= 58.0 && s.start <= branding::REVEAL_START + branding::REVEAL_SPAN + 1e-9, "start {}", s.start);
+        }
+        slots.sort_by(|a, b| a.start.total_cmp(&b.start));
+        for w in slots.windows(2) {
+            assert!(w[0].density >= w[1].density, "a later start has more smoke ({} < {})", w[0].density, w[1].density);
+        }
+        r.play_to(59.5);
+        let cells = r.engine_cells();
+        let inputs = r.input_cells();
+        for (col, row, _) in r.fx.glyph_cells() {
+            let c = &cells[row * r.fx.grid().0 + col];
+            assert_eq!(Some(&c.symbol), inputs[row * r.fx.grid().0 + col].as_ref(), "glyph cell ({col}, {row}) at 59.5");
+            assert_eq!(c.fg, hexrgb(0xf3efe6), "glyph cell ({col}, {row}) not in hold at 59.5");
+        }
+        for (c, i) in cells.iter().zip(&inputs) {
+            if i.is_none() {
+                assert_eq!(c.symbol, HALF_BLOCK, "a fill cell became a glyph");
+            }
+        }
+        r.play_to(61.0);
+        let (share, total) = visible_share(&r);
+        assert!(total > 0 && share >= 0.95, "{:.1}% of {total} characters visible at 61.0 ({fps} fps)", 100.0 * share);
+        let min_contrast = r.engine_cells().iter().filter(|c| c.symbol != HALF_BLOCK).map(|c| luma(c.fg) - luma(c.bg)).fold(1.0, f64::min);
+        assert!(min_contrast >= 0.438 - 1e-9, "contrast {min_contrast:.3} below the cap's guarantee");
+    }
+}
+
+/// Every tick of the reveal and the dissolve, per glyph cell, from what the
+/// engine shows. Glyph mode comes from the state index (a `▀` input symbol
+/// is still a glyph), and the symbol is checked separately:
+/// - a cell in glyph mode shows its own input symbol, and one in `▀` mode
+///   shows `▀`;
+/// - a glyph switches on or off only next to a flat cell of its plate;
+/// - (`smooth`) the `▀` handoff moves pixels by ≤ 48 (plus the scene's own
+///   change in the cell), the plate by ≤ 48 at a switch, the fg by ≤ 48 per
+///   tick (`smooth_fg`), and the glyph-aware mean step stays under
+///   `STEP_LIMIT`.
+fn check_glyph_fades(r: &mut Run, smooth: bool, smooth_fg: bool, label: &str) {
+    let cols = r.fx.grid().0;
+    let slots: Vec<(usize, usize)> = r.fx.glyph_cells().iter().map(|&(c, rw, s)| (rw * cols + c, s)).collect();
+    let inputs = r.input_cells();
+    let b = text::HANDOFF_STATES;
+    for (a, z) in [(58.0, 59.6), (62.4, 64.0)] {
+        r.play_to(a - r.fx.dt());
+        let mut prev = r.engine_cells();
+        let mut prev_px = r.cell_pixels();
+        let mut prev_s: Vec<usize> = slots.iter().map(|&(_, s)| r.fx.glyph_state_of(s)).collect();
+        let mut prev_scene = pixbuf_rgb(r.fx.unquantised());
+        while r.fx.time() < z - 1e-9 {
+            if r.frame().is_none() {
+                break;
+            }
+            let t = r.fx.time();
+            let cur = r.engine_cells();
+            let px = r.cell_pixels();
+            let scene = pixbuf_rgb(r.fx.unquantised());
+            if smooth {
+                let (d, _) = frame_distance(&prev_px, &px);
+                assert!(d < STEP_LIMIT, "{label}: glyph-aware step {d:.2} at {t:.3}");
+            }
+            for (k, &(idx, slot)) in slots.iter().enumerate() {
+                let s = r.fx.glyph_state_of(slot);
+                let (p, c) = (&prev[idx], &cur[idx]);
+                let (pg, cg) = (prev_s[k] > b, s > b);
+                let own = inputs[idx].as_deref().expect("glyph cells are input cells");
+                assert_eq!(c.symbol, if cg { own } else { HALF_BLOCK }, "{label}: cell {idx} in state {s} shows the wrong symbol at {t:.3}");
+                if !pg && cg {
+                    assert_eq!(p.fg, p.bg, "{label}: a glyph appeared next to a non-flat cell at {t:.3} (cell {idx}, {} → {s})", prev_s[k]);
+                }
+                if pg && !cg {
+                    assert_eq!(c.fg, c.bg, "{label}: a glyph vanished into a non-flat cell at {t:.3} (cell {idx}, {} → {s})", prev_s[k]);
+                }
+                if smooth {
+                    if pg != cg {
+                        assert!(dist(p.bg, c.bg) <= 48.0, "{label}: plate jumps {:.1} at a switch at {t:.3} (cell {idx})", dist(p.bg, c.bg));
+                    }
+                    let handoff = (1..=b).contains(&s) || (1..=b).contains(&prev_s[k]);
+                    if !pg && !cg && handoff {
+                        // The blend's own step, allowing for the scene's change in the
+                        // cell: the plate follows the cell's mean, and its nearest
+                        // plate entry can move twice as far as that mean.
+                        let (row, col) = (idx / cols, idx % cols);
+                        let moved_cell = (0..2).map(|h| dist(prev_scene[(2 * row + h) * cols + col], scene[(2 * row + h) * cols + col])).fold(0.0, f64::max);
+                        for (x, y) in [(p.fg, c.fg), (p.bg, c.bg)] {
+                            assert!(
+                                dist(x, y) <= 48.0 + 2.0 * moved_cell,
+                                "{label}: handoff pixel step {:.1} (scene moved {moved_cell:.1}) at {t:.3} (cell {idx}, state {} → {s})",
+                                dist(x, y),
+                                prev_s[k]
+                            );
+                        }
+                    }
+                    if pg && cg && smooth_fg {
+                        assert!(dist(p.fg, c.fg) <= 48.0, "{label}: fg step {:.1} at {t:.3} (cell {idx}, state {} → {s})", dist(p.fg, c.fg), prev_s[k]);
+                        assert!(dist(p.bg, c.bg) <= 48.0, "{label}: plate step {:.1} in glyph mode at {t:.3} (cell {idx})", dist(p.bg, c.bg));
+                    }
+                }
+                prev_s[k] = s;
+            }
+            prev = cur;
+            prev_px = px;
+            prev_scene = scene;
+        }
+    }
+}
+
+#[test]
+fn glyph_fades_are_continuous() {
+    for fps in [60i64, 120] {
+        let mut r = run(GRID_1080, fps, 1);
+        check_glyph_fades(&mut r, true, true, &format!("fixture {fps} fps"));
+        // A wide block over contrasting scenery: 11d's sky, horizon, ground
+        // and tower, then scene 1's sky, tower and stack in the loop fade.
+        let row = |k: usize| -> String { (0..110).map(|i| ["█", "▀", "▄", "o", "m", "a", "r", "c", "h", "y", "─"][(i + k) % 11]).collect() };
+        let wide: String = (0..12).map(row).collect::<Vec<_>>().join("\n");
+        let mut w = run_input(GRID_1080, fps, 1, config(57.9, 1.0, false), &wide);
+        assert_eq!(w.fx.text_plan().tier, 0);
+        check_glyph_fades(&mut w, true, true, &format!("wide {fps} fps"));
+        // Accelerated playback (4× faster): the timing and the flat-cell
+        // switches hold; per-tick steps are naturally 4× larger.
+        let mut q = run_with(GRID_1080, fps, 1, config(57.9, 0.25, false));
+        check_glyph_fades(&mut q, false, false, &format!("fixture {fps} fps ×0.25"));
+        let mut q = run_with(GRID_1080, fps, 1, config(59.4, 0.25, false));
+        q.play_to(59.5 + 2.0 * q.fx.dt());
+        let (share, total) = visible_share(&q);
+        assert_eq!(share, 1.0, "{fps} fps ×0.25: {:.1}% of {total} visible just after 59.5", 100.0 * share);
+    }
+}
+
+/// A large single-symbol input: one glyph per cell of the whole grid, over
+/// every part of the scene (the plate must still be stable).
+#[test]
+fn glyph_fades_full_grid() {
+    for (grid, fps) in [(GRID_1080, 60i64), (GRID_4K, 120)] {
+        let full: String = (0..grid.1).map(|_| "A".repeat(grid.0 as usize)).collect::<Vec<_>>().join("\n");
+        let mut r = run_input(grid, fps, 1, config(57.9, 1.0, false), &full);
+        assert_eq!(r.fx.text_plan().tier, 0);
+        assert_eq!(r.fx.glyph_cells().len(), (grid.0 * grid.1) as usize);
+        check_glyph_fades(&mut r, true, true, &format!("full grid {grid:?} {fps} fps"));
+    }
+}
+
+/// `n` distinct single-width Private Use Area symbols, once each.
+fn pua_text(n: usize, width: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        if i > 0 && i % width == 0 {
+            s.push('\n');
+        }
+        let cp = if i < 6400 { 0xE000 + i as u32 } else { 0xF0000 + (i - 6400) as u32 };
+        s.push(char::from_u32(cp).unwrap());
+    }
+    s
+}
+
+#[test]
+fn branding_symbol_tiers() {
+    for (n, grid, width, tier) in [(30, GRID_1080, 120, 1), (60, GRID_1080, 120, 2), (72, GRID_1080, 120, 3), (488, GRID_1080, 122, 5), (2048, GRID_4K, 256, 6)] {
+        let input = pua_text(n, width);
+        let mut r = run_input(grid, 60, 1, config(57.9, 1.0, false), &input);
+        let plan = r.fx.text_plan();
+        assert_eq!((plan.tier, plan.k_symbols), (tier, n), "n = {n}");
+        check_glyph_fades(&mut r, true, tier <= 2, &format!("{n} symbols"));
+        let mut r = run_input(grid, 60, 1, config(60.9, 1.0, false), &input);
+        r.play_to(61.0);
+        let (share, total) = visible_share(&r);
+        assert_eq!(total, n);
+        assert_eq!(share, 1.0, "n = {n}: {:.1}% visible", 100.0 * share);
+        let glyphs: std::collections::HashSet<(String, [u8; 3], [u8; 3])> =
+            r.engine_cells().into_iter().filter(|c| c.symbol != HALF_BLOCK).map(|c| (c.symbol, c.fg, c.bg)).collect();
+        assert!(glyphs.len() <= text::text_appearance_bound(n + 1, n));
+    }
+    // Overflow: only the k most frequent symbols become glyphs.
+    let n = 5200;
+    let mut r = run_input(GRID_4K, 60, 1, config(60.9, 1.0, false), &pua_text(n, 260));
+    let k = text::SYMBOL_BUDGET - (n + 1);
+    assert_eq!(r.fx.text_plan().k_symbols, k);
+    r.play_to(61.0);
+    let (share, total) = visible_share(&r);
+    assert_eq!(total, n);
+    assert_eq!((share * n as f64).round() as usize, k, "exactly the k most frequent symbols are shown");
+    assert!(share >= 0.95);
+    // A full grid of distinct symbols: the engine's defaults use the budget, no glyphs.
+    let full = pua_text(274 * 67, 274);
+    let mut r = run_input(GRID_4K, 60, 1, config(60.9, 1.0, false), &full);
+    assert_eq!(r.fx.text_plan().k_symbols, 0);
+    r.play_to(61.0);
+    assert!(r.engine_cells().iter().all(|c| c.symbol == HALF_BLOCK), "no glyphs in the full-grid overflow");
+}
+
+#[test]
+fn branding_block_glyphs() {
+    let input = "▀▀▀ ▄▄▄ ███\n█▄▀ ▀▄█ ▄█▀";
+    for fps in [60i64, 120] {
+        let mut r = run_input(GRID_1080, fps, 1, config(57.9, 1.0, false), input);
+        check_glyph_fades(&mut r, true, true, &format!("blocks {fps} fps"));
+        let mut r = run_input(GRID_1080, fps, 1, config(60.9, 1.0, false), input);
+        r.play_to(61.0);
+        let (share, total) = visible_share(&r);
+        assert_eq!((share, total), (1.0, 18));
+        let cells = r.engine_cells();
+        for (col, row, _) in r.fx.glyph_cells() {
+            assert_eq!(cells[row * r.fx.grid().0 + col].fg, hexrgb(0xf3efe6));
+        }
+    }
+}
+
+/// Dev aid (not run by default): effect tick time (step, compose, emit,
+/// frame) over the branding for a full 4K grid of glyphs at 120 fps.
+/// `cargo test --release --test starship branding_large_input_tick_time -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn branding_large_input_tick_time() {
+    let full: String = (0..GRID_4K.1).map(|_| "A".repeat(GRID_4K.0 as usize)).collect::<Vec<_>>().join("\n");
+    let mut r = run_input(GRID_4K, 120, 1, config(57.8, 1.0, false), &full);
+    let mut ms = Vec::new();
+    let mut changed = Vec::new();
+    loop {
+        let t0 = std::time::Instant::now();
+        if r.frame().is_none() {
+            break;
+        }
+        ms.push((t0.elapsed().as_secs_f64() * 1e3, r.fx.time()));
+        changed.push(r.fx.changed_cells());
+    }
+    let mut v: Vec<f64> = ms.iter().map(|m| m.0).collect();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let worst = ms.iter().fold((0.0, 0.0), |a, &m| if m.0 > a.0 { m } else { a });
+    eprintln!("effect tick ms: p50 {:.2} p99 {:.2} max {:.2} at {:.3}s", v[v.len() / 2], v[v.len() * 99 / 100], worst.0, worst.1);
+    for (a, b) in [(57.8, 58.0), (58.0, 59.5), (59.5, 62.5), (62.5, 63.7), (63.7, 64.0)] {
+        let idx: Vec<usize> = (0..ms.len()).filter(|&i| ms[i].1 >= a && ms[i].1 < b).collect();
+        let mut w: Vec<f64> = idx.iter().map(|&i| ms[i].0).collect();
+        w.sort_by(|x, y| x.total_cmp(y));
+        let ch = idx.iter().map(|&i| changed[i]).sum::<usize>() as f64 / idx.len().max(1) as f64;
+        if !w.is_empty() {
+            eprintln!("  {a}–{b}: p50 {:.2} max {:.2} changed cells/tick {ch:.0}", w[w.len() / 2], w[w.len() - 1]);
+        }
+    }
 }
